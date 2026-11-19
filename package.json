@@ -3,7 +3,7 @@
   "displayName": "Keil 文本配置向导",
   "description": "通过表单编辑带 Keil Configuration Wizard 注释的源文件",
   "publisher": "local-tools",
-  "version": "0.5.15",
+  "version": "0.5.17",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -21,6 +21,7 @@
   ],
   "files": [
     "extension.js",
+    "integer-literals.js",
     "workspace-files.js",
     "media/wizard.svg",
     "example.h",

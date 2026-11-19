@@ -11,6 +11,8 @@
 // <1=> 奇校验
 // <2=> 偶校验
 #define UART_FLAGS 0xA0
+// <o> 二进制掩码
+#define UART_MASK 0b00000011U
 // <s.16> 设备名称
 #define DEVICE_NAME "BOARD"
 // </h>

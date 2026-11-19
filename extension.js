@@ -1,15 +1,17 @@
 const vscode = require('vscode');
 const { randomBytes } = require('node:crypto');
 const { createWorkspaceFilesView, fileDropMimeTypes } = require('./workspace-files');
+const { parseInteger, formatInteger } = require('./integer-literals');
 let flushViewStatesOnDeactivate;
 
 const wizardStart = /<<<\s*Use Configuration Wizard in Context Menu\s*>>>/i;
-const cTokens = /\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[A-Za-z_$][\w$]*|-?(?:0[xX][a-fA-F0-9]+|\d+)(?=(?:[uUlL]{1,3})?\b)(?![\d.])/g;
-const asmTokens = new RegExp(/;[^\r\n]*/.source + '|' + cTokens.source, 'g');
+const cTokens = /\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[A-Za-z_$][\w$]*|[+-]?(?:\d|\.\d)(?:[eEpP][+-]|[\w$.'])*/g;
+const asmTokens = new RegExp(/;[^\r\n]*|[+-]?&[\da-fA-F][\w$.']*/.source + '|' + cTokens.source, 'g');
 
 function parse(source, uri) {
   if (!wizardStart.test(source)) return [];
-  const tokens = /\.(?:s|asm|a51|a66|inc|src|ini)$/i.test(uri?.path ?? '') ? asmTokens : cTokens;
+  const assembly = /\.(?:s|asm|a51|a66|inc|src|ini)$/i.test(uri?.path ?? '');
+  const tokens = assembly ? asmTokens : cTokens;
   const rows = [];
   let active = false;
   let current;
@@ -29,14 +31,14 @@ function parse(source, uri) {
           current.help = [current.help, label].filter(Boolean).join(' ');
           continue;
         }
-        const choice = /^(0x[\da-f]+|\d+)=$/i.exec(kind);
-        if (choice && current) {
-          current.choices.push([BigInt(choice[1]).toString(), label]);
+        const choice = /^([+-]?[\w'&]+)=$/.exec(kind);
+        if (choice && current && parseInteger(choice[1], assembly)) {
+          current.choices.push([choice[1], label]);
           continue;
         }
-        const range = /^(-?(?:0x[\da-f]+|\d+))-(-?(?:0x[\da-f]+|\d+))(?::(0x[\da-f]+|\d+))?$/i.exec(kind);
-        if (range && current) {
-          current.range = range.slice(1);
+        const range = /^([+-]?[\w'&]+)-([+-]?[\w'&]+)(?::([+-]?[\w'&]+))?$/.exec(kind)?.slice(1);
+        if (range && current && range.every(value => value === undefined || parseInteger(value, assembly))) {
+          current.range = range;
           continue;
         }
         if (kind.startsWith('#') && current) {
@@ -46,7 +48,7 @@ function parse(source, uri) {
         const option = /^([oqes])(\d*)(?:\.(\d+)(?:\.\.(\d+))?)?$/.exec(kind);
         if (option) {
           const [, type, skip, low, high] = option;
-          current = { type, label, skip: Number(skip), low, high, choices: [] };
+          current = { type, label, skip: Number(skip), low, high, choices: [], assembly };
           rows.push(current);
           pending.push(current);
         } else {
@@ -54,16 +56,19 @@ function parse(source, uri) {
           rows.push({ type: kind === 'h' ? 'h' : /^\/[he]$/.test(kind) ? 'end' : 'unsupported', label: label || kind });
         }
       }
-    } else if (active) {
+    } else if (active && pending.length) {
+      const isNumeric = /^[+-]?(?:\d|\.\d|&)/.test(raw);
+      const numeric = isNumeric ? parseInteger(raw, assembly) : undefined;
       for (let index = pending.length - 1; index >= 0; index--) {
         const current = pending[index];
 
-        if (!(current.type === 's' ? raw.startsWith('"') : /^-?\d/.test(raw))) continue;
+        if (!(current.type === 's' ? raw.startsWith('"') : isNumeric)) continue;
         if (current.skip > 0) {
           current.skip--;
           continue;
         }
-        Object.assign(current, { raw, offset: token.index });
+        Object.assign(current, { raw, offset: token.index, numeric });
+        if (isNumeric && !numeric) current.unsupported = true;
         pending.splice(index, 1);
       }
     }
@@ -71,9 +76,10 @@ function parse(source, uri) {
   return rows;
 }
 
-function integer(value) {
-  if (!/^-?(?:0x[\da-f]+|\d+)$/i.test(value)) throw Error('请输入十进制或十六进制整数。');
-  return value.startsWith('-') ? -BigInt(value.slice(1)) : BigInt(value);
+function integer(value, assembly) {
+  const literal = parseInteger(value, assembly);
+  if (!literal) throw Error('请输入有效的整数字面量。');
+  return literal.value;
 }
 
 function field(row) {
@@ -84,11 +90,15 @@ function field(row) {
   return { low, mask: (1n << (high - low + 1n)) - 1n };
 }
 
+function numericValue(row) {
+  const value = row.numeric.value;
+  const bits = field(row);
+  return bits ? (value >> bits.low) & bits.mask : value;
+}
+
 function display(row) {
   if (row.type === 's') return row.raw.slice(1, -1);
-  const value = integer(row.raw);
-  const bits = field(row);
-  return bits ? ((value >> bits.low) & bits.mask).toString() : value.toString();
+  return row.low === undefined ? row.raw : formatInteger(numericValue(row), row.numeric, false);
 }
 
 function replacement(row, input) {
@@ -97,24 +107,20 @@ function replacement(row, input) {
     if (row.low !== undefined && input.length > Number(row.low)) throw Error('字符串超过标注长度。');
     return '"' + input + '"';
   }
-  let value = integer(input);
-  if (row.choices.length && !row.choices.some(([choice]) => BigInt(choice) === value)) throw Error('请选择列表中的值。');
+  let value = integer(input.trim(), row.assembly);
+  if (row.choices.length && !row.choices.some(([choice]) => integer(choice, row.assembly) === value)) throw Error('请选择列表中的值。');
   if (row.range) {
-    const [min, max, step] = row.range.map(item => item === undefined ? 1n : integer(item));
+    const [min, max, step] = row.range.map(item => item === undefined ? 1n : integer(item, row.assembly));
     if (value < min || value > max || step < 1n || (value - min) % step !== 0n) throw Error('数值超出标注范围或不符合步长。');
   }
   const bits = field(row);
-  const original = integer(row.raw);
+  const original = row.numeric.value;
   if (bits) {
     if (value < 0n || value > bits.mask) throw Error('数值超出位域范围。');
     value = (original & ~(bits.mask << bits.low)) | (value << bits.low);
   }
   if (value === original) return row.raw;
-  const hex = /^-?(0[xX])([\da-f]+)$/i.exec(row.raw);
-  if (!hex) return value.toString();
-  let digits = (value < 0n ? -value : value).toString(16).padStart(hex[2].length, '0');
-  if (hex[1] === '0X' || /[A-F]/.test(hex[2])) digits = digits.toUpperCase();
-  return (value < 0n ? '-' : '') + hex[1] + digits;
+  return formatInteger(value, row.numeric);
 }
 
 function escape(value) {
@@ -404,16 +410,17 @@ function render(rows, revision, nonce, panelKey = '', viewState = {}) {
       control = '未找到可编辑的值';
       if (row.raw) {
         try {
-          const value = display(row);
           const id = ' data-index="' + index + '"';
           if (row.type === 'q' || row.type === 'e') {
-            control = '<input type="checkbox"' + id + (value !== '0' ? ' checked' : '') + '>';
+            control = '<input type="checkbox"' + id + (numericValue(row) !== 0n ? ' checked' : '') + '>';
           } else if (row.choices.length) {
+            const value = numericValue(row);
+            const selected = row.choices.findIndex(([key]) => integer(key, row.assembly) === value);
             control = '<select' + id + '>' +
-              (row.choices.some(([key]) => key === value) ? '' : '<option selected disabled>当前值 ' + escape(value) + '</option>') +
-              row.choices.map(([key, label]) => '<option value="' + escape(key) + '"' + (key === value ? ' selected' : '') + '>' + escape(label) + '</option>').join('') + '</select>';
+              (selected >= 0 ? '' : '<option selected disabled>当前值 ' + escape(display(row)) + '</option>') +
+              row.choices.map(([key, label], choiceIndex) => '<option value="' + escape(key) + '"' + (choiceIndex === selected ? ' selected' : '') + '>' + escape(label || key) + '</option>').join('') + '</select>';
           } else {
-            control = '<input type="text"' + id + ' value="' + escape(value) + '">';
+            control = '<input type="text"' + id + ' value="' + escape(display(row)) + '">';
           }
         } catch (error) {
           control = escape(error.message);
