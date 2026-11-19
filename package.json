@@ -3,7 +3,7 @@
   "displayName": "Keil 文本配置向导",
   "description": "通过表单编辑带 Keil Configuration Wizard 注释的源文件",
   "publisher": "local-tools",
-  "version": "0.5.9",
+  "version": "0.5.15",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,6 +16,9 @@
     "Other"
   ],
   "main": "./extension.js",
+  "activationEvents": [
+    "onWebviewPanel:keilWizard"
+  ],
   "files": [
     "extension.js",
     "workspace-files.js",
@@ -44,6 +47,14 @@
         "command": "keilWizard.openSource"
       },
       {
+        "title": "打开大纲",
+        "command": "keilWizard.showOutline"
+      },
+      {
+        "title": "关闭大纲",
+        "command": "keilWizard.hideOutline"
+      },
+      {
         "title": "添加到 Keil 配置向导",
         "command": "keilWizard.add"
       },
@@ -58,12 +69,32 @@
         {
           "command": "keilWizard.openSource",
           "when": "false"
+        },
+        {
+          "command": "keilWizard.showOutline",
+          "when": "false"
+        },
+        {
+          "command": "keilWizard.hideOutline",
+          "when": "false"
+        }
+      ],
+      "webview/context": [
+        {
+          "command": "keilWizard.showOutline",
+          "when": "webviewId == keilWizard && !keilWizardOutlineVisible",
+          "group": "navigation"
+        },
+        {
+          "command": "keilWizard.hideOutline",
+          "when": "webviewId == keilWizard && keilWizardOutlineVisible",
+          "group": "navigation"
         }
       ],
       "explorer/context": [
         {
           "command": "keilWizard.add",
-          "group": "navigation",
+          "group": "z_keilWizard",
           "when": "explorerResourceIsFolder == false"
         }
       ],

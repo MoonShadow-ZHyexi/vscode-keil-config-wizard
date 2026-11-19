@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const { randomBytes } = require('node:crypto');
-const { createWorkspaceFilesView } = require('./workspace-files');
+const { createWorkspaceFilesView, fileDropMimeTypes } = require('./workspace-files');
+let flushViewStatesOnDeactivate;
 
 const wizardStart = /<<<\s*Use Configuration Wizard in Context Menu\s*>>>/i;
 const cTokens = /\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[A-Za-z_$][\w$]*|-?(?:0[xX][a-fA-F0-9]+|\d+)(?=(?:[uUlL]{1,3})?\b)(?![\d.])/g;
@@ -120,15 +121,21 @@ function escape(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 }
 
-function initializeWebview(revision) {
+function initializeWebview(revision, dropMimeTypes, sourceUri, savedState) {
   const vscode = acquireVsCodeApi();
   const layout = document.querySelector('.layout');
   const content = document.querySelector('.content');
   const outline = document.querySelector('.outline');
   const outlineList = document.querySelector('.outline-list');
   const splitter = document.querySelector('.splitter');
-  const state = vscode.getState() || {};
+  const menuContext = JSON.parse(layout.dataset.vscodeContext);
+  const state = vscode.getState()?.viewState ?? savedState ?? {};
   const collapsed = new Set(state.collapsed || []);
+  const minimumOutlineWidth = 112;
+  let outlineWidth = Math.max(minimumOutlineWidth, state.width || 240);
+  let outlineHidden = state.outlineHidden !== false;
+  let outlineScroll = state.outlineScroll || 0;
+  let drag;
 
   const parents = [];
   const entries = Array.from(outlineList.querySelectorAll('.outline-row'), row => {
@@ -148,17 +155,25 @@ function initializeWebview(revision) {
   let activeSection;
   let highlighted;
   let outlineJump;
+  let lastSnapshot;
 
-  function saveState() {
-    vscode.setState({
-      width: outline.getBoundingClientRect().width,
+  function saveState(persist = true) {
+    const snapshot = {
+      width: outlineWidth,
+      outlineHidden,
       scroll: content.scrollTop,
-      outlineScroll: outlineList.scrollTop,
-      collapsed: [...collapsed]
-    });
+      outlineScroll: outline.hidden ? outlineScroll : outlineList.scrollTop,
+      collapsed: [...collapsed],
+      activeSection: activeSection?.id ?? null
+    };
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === lastSnapshot) return;
+    lastSnapshot = serialized;
+    vscode.setState({ sourceUri, viewState: snapshot });
+    if (persist) vscode.postMessage({ type: 'saveViewState', state: snapshot });
   }
 
-  function highlightCurrent() {
+  function highlightCurrent(reveal = true) {
     let visible = activeSection;
     while (visible?.row.hidden) visible = visible.parent;
     if (highlighted !== visible) {
@@ -166,7 +181,7 @@ function initializeWebview(revision) {
       highlighted = visible;
       highlighted?.label.setAttribute('aria-current', 'location');
     }
-    if (!visible) return;
+    if (!reveal || !visible || outline.hidden) return;
     const row = visible.row.getBoundingClientRect();
     const viewport = outlineList.getBoundingClientRect();
     if (row.top < viewport.top) outlineList.scrollTop += row.top - viewport.top;
@@ -184,19 +199,43 @@ function initializeWebview(revision) {
     }
   }
 
-  function updateCurrent() {
+  function updateCurrent(reveal = true) {
     const boundary = content.getBoundingClientRect().top + 40;
     activeSection = undefined;
     for (const entry of entries) {
       if (entry.heading.getBoundingClientRect().top > boundary) break;
       activeSection = entry;
     }
-    highlightCurrent();
+    highlightCurrent(reveal);
   }
 
-  function setWidth(width) {
-    const max = Math.max(80, layout.clientWidth - 120);
-    layout.style.setProperty('--outline-width', Math.min(max, Math.max(80, width)) + 'px');
+  function maximumOutlineWidth() {
+    return Math.max(0, layout.clientWidth - splitter.offsetWidth - 120);
+  }
+
+  function applyOutlineWidth() {
+    const max = maximumOutlineWidth();
+    const width = outlineHidden || max < minimumOutlineWidth ? 0 : Math.min(max, outlineWidth);
+    const wasHidden = outline.hidden;
+    if (!wasHidden && !width) outlineScroll = outlineList.scrollTop;
+    outline.hidden = width === 0;
+    if (wasHidden !== outline.hidden) {
+      menuContext.keilWizardOutlineVisible = !outline.hidden;
+      layout.dataset.vscodeContext = JSON.stringify(menuContext);
+    }
+    layout.style.setProperty('--outline-width', width + 'px');
+    splitter.setAttribute('aria-valuemax', String(max));
+    splitter.setAttribute('aria-valuenow', String(Math.round(width)));
+    splitter.title = width ? '拖动以调整大纲宽度' : '向右拖动以打开大纲';
+    if (wasHidden && width) {
+      outlineList.scrollTop = outlineScroll;
+    }
+  }
+
+  function setOutlineVisibility(visible) {
+    outlineHidden = !visible;
+    applyOutlineWidth();
+    saveState();
   }
 
   function setCollapsed(entry, isCollapsed) {
@@ -208,10 +247,13 @@ function initializeWebview(revision) {
   }
 
   updateOutline();
-  setWidth(state.width || 240);
+  applyOutlineWidth();
   content.scrollTop = state.scroll || 0;
-  outlineList.scrollTop = state.outlineScroll || 0;
-  updateCurrent();
+  outlineJump = content.scrollTop;
+  activeSection = entriesById.get(state.activeSection);
+  if (activeSection) highlightCurrent(false);
+  else updateCurrent(false);
+  saveState(false);
 
   content.addEventListener('scroll', () => {
     if (content.scrollTop !== outlineJump) {
@@ -220,8 +262,15 @@ function initializeWebview(revision) {
     }
     saveState();
   });
-  outlineList.addEventListener('scroll', saveState);
-  window.addEventListener('resize', () => setWidth(outline.getBoundingClientRect().width));
+  outlineList.addEventListener('scroll', () => {
+    if (outline.hidden) return;
+    outlineScroll = outlineList.scrollTop;
+    saveState();
+  });
+  window.addEventListener('resize', applyOutlineWidth);
+  window.addEventListener('message', event => {
+    if (event.data?.type === 'setOutlineVisibility') setOutlineVisibility(event.data.visible);
+  });
 
   outline.addEventListener('click', event => {
     const action = event.target.closest('[data-action]');
@@ -277,20 +326,51 @@ function initializeWebview(revision) {
   });
 
   splitter.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || drag) return;
+    drag = {
+      pointerId: event.pointerId,
+      width: outlineWidth,
+      offset: event.clientX - splitter.getBoundingClientRect().left
+    };
     splitter.setPointerCapture(event.pointerId);
     event.preventDefault();
   });
   splitter.addEventListener('pointermove', event => {
-    if (splitter.hasPointerCapture(event.pointerId)) {
-      setWidth(event.clientX - layout.getBoundingClientRect().left);
-      saveState();
-    }
+    if (drag?.pointerId !== event.pointerId) return;
+    const width = event.clientX - layout.getBoundingClientRect().left - drag.offset;
+    outlineHidden = width < minimumOutlineWidth;
+    outlineWidth = outlineHidden ? drag.width : Math.max(minimumOutlineWidth, Math.min(width, maximumOutlineWidth()));
+    applyOutlineWidth();
+    saveState();
+  });
+  splitter.addEventListener('lostpointercapture', event => {
+    if (drag?.pointerId === event.pointerId) drag = undefined;
   });
   splitter.addEventListener('keydown', event => {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
     event.preventDefault();
-    setWidth(outline.getBoundingClientRect().width + (event.key === 'ArrowRight' ? 10 : -10));
+    if (outline.hidden) {
+      if (event.key === 'ArrowRight') setOutlineVisibility(true);
+      return;
+    }
+    const width = Math.min(outlineWidth, maximumOutlineWidth()) + (event.key === 'ArrowRight' ? 10 : -10);
+    outlineHidden = width < minimumOutlineWidth;
+    if (!outlineHidden) outlineWidth = Math.min(width, maximumOutlineWidth());
+    applyOutlineWidth();
     saveState();
+  });
+  document.addEventListener('dragover', event => {
+    const transfer = event.dataTransfer;
+    if (!transfer || !dropMimeTypes.some(mime => transfer.types.includes(mime))) return;
+    event.preventDefault();
+    transfer.dropEffect = 'copy';
+  });
+  document.addEventListener('drop', event => {
+    const transfer = event.dataTransfer;
+    if (!transfer || !dropMimeTypes.some(mime => transfer.types.includes(mime))) return;
+    event.preventDefault();
+    const data = Object.fromEntries(dropMimeTypes.map(mime => [mime, transfer.getData(mime)]));
+    vscode.postMessage({ type: 'dropFiles', data });
   });
   document.addEventListener('change', ({ target }) => {
     if (!target.dataset.index) return;
@@ -300,7 +380,7 @@ function initializeWebview(revision) {
   });
 }
 
-function render(rows, revision, nonce) {
+function render(rows, revision, nonce, panelKey = '', viewState = {}) {
   let body = '';
   const outlineItems = [];
   let depth = 0;
@@ -370,11 +450,16 @@ function render(rows, revision, nonce) {
     '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'nonce-' + nonce + '\'; script-src \'nonce-' + nonce + '\'">' +
     '<style nonce="' + nonce + '">*{box-sizing:border-box}html,body{height:100%;margin:0;padding:0}body{font-size:16px;line-height:1.5;overflow:hidden}.layout{display:flex;height:100%;--outline-width:240px}.outline{flex:0 0 var(--outline-width);min-width:0;display:flex;flex-direction:column;overflow:hidden;background:var(--vscode-sideBar-background)}' +
     `
-    .outline-header{flex:none;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;padding:12px 10px 8px;border-bottom:1px solid var(--vscode-panel-border)}
-    .outline-title{flex:1 1 90px;min-width:0;margin:0;font-size:16px;font-weight:600;overflow-wrap:anywhere;color:var(--vscode-sideBarTitle-foreground)}
-    .outline-actions{display:flex;flex-wrap:wrap;gap:4px}
+    .outline[hidden]{display:none}
+    .outline-header{flex:none;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:12px 10px 8px;border-bottom:1px solid var(--vscode-panel-border)}
+    .outline-title{flex:1;min-width:0;margin:0;font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--vscode-sideBarTitle-foreground)}
+    .outline-actions{display:flex;flex:none;gap:4px}
     .outline-actions button,.outline-toggle{border:0;background:transparent;color:inherit;cursor:pointer}
-    .outline-actions button{font:inherit;font-size:12px;padding:5px;white-space:nowrap;border-radius:4px}
+    .outline-actions button{display:grid;place-items:center;width:24px;height:24px;padding:0;border-radius:4px}
+    .outline-action-icon{position:relative;width:12px;height:12px;border:1px solid currentColor;border-radius:2px;box-shadow:2px -2px 0 -1px var(--vscode-sideBar-background),3px -3px 0 -1px currentColor}
+    .outline-action-icon::before,.outline-action-icon::after{position:absolute;inset:0;margin:auto;background:currentColor}
+    .outline-action-icon::before{content:"";width:6px;height:1px}
+    [data-action="expand"] .outline-action-icon::after{content:"";width:1px;height:6px}
     .outline-actions button:hover,.outline-row:hover{background:var(--vscode-list-hoverBackground)}
     .outline button:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
     .outline-list{flex:1;min-height:0;overflow:auto;padding-bottom:12px;color:var(--vscode-sideBar-foreground);font-size:14px}
@@ -423,38 +508,54 @@ function render(rows, revision, nonce) {
     ` +
     'p{color:var(--vscode-descriptionForeground);margin:0 0 24px}' +
     '@media(max-width:600px){.content{padding:20px 16px 32px}}</style>' +
-    '<div class="layout"><nav class="outline" aria-label="配置大纲"><div class="outline-header">' +
-    (outlineTitle ? '<h2 class="outline-title">' + escape(outlineTitle.label) + '</h2>' : '<span class="empty-outline">没有分组</span>') +
-    '<div class="outline-actions"><button type="button" data-action="expand">全部展开</button><button type="button" data-action="collapse">全部折叠</button></div></div><div class="outline-list">' +
+    '<div class="layout" data-vscode-context="' + escape(JSON.stringify({ keilWizardPanel: panelKey, keilWizardOutlineVisible: false })) + '">' +
+    '<nav id="keil-outline" class="outline" aria-label="配置大纲" hidden><div class="outline-header">' +
+    (outlineTitle ? '<h2 class="outline-title" title="' + escape(outlineTitle.label) + '">' + escape(outlineTitle.label) + '</h2>' : '<span class="outline-title empty-outline">没有分组</span>') +
+    '<div class="outline-actions">' +
+    '<button type="button" data-action="expand" title="全部展开" aria-label="全部展开"><span class="outline-action-icon" aria-hidden="true"></span></button>' +
+    '<button type="button" data-action="collapse" title="全部折叠" aria-label="全部折叠"><span class="outline-action-icon" aria-hidden="true"></span></button>' +
+    '</div></div><div class="outline-list">' +
     outline +
-    '</div></nav><div class="splitter" role="separator" aria-label="调整大纲宽度" aria-orientation="vertical" tabindex="0"></div><main class="content"><div class="configuration">' +
+    '</div></nav><div class="splitter" role="separator" aria-label="调整大纲宽度" aria-orientation="vertical" aria-controls="keil-outline" aria-valuemin="0" tabindex="0"></div><main class="content"><div class="configuration">' +
     (body || '<p>没有找到带配置向导起始标记的配置项。</p>') + '</div></main></div>' +
-    '<script nonce="' + nonce + '">(' + initializeWebview.toString() + ')(' + revision + ');</script></html>';
+    '<script nonce="' + nonce + '">(' + initializeWebview.toString() + ')(' + revision + ', ' +
+    JSON.stringify(fileDropMimeTypes) + ', ' + JSON.stringify(panelKey).replace(/</g, '\\u003c') + ', ' +
+    JSON.stringify(viewState).replace(/</g, '\\u003c') + ');</script></html>';
 }
 
 function activate(context) {
   const panels = new Map();
-  context.subscriptions.push(vscode.commands.registerCommand('keilWizard.open', async uri => {
-    const targetColumn = vscode.window.activeTextEditor?.viewColumn ?? vscode.window.activeNotebookEditor?.viewColumn ?? vscode.ViewColumn.Active;
-    let document = vscode.window.activeTextEditor?.document;
-    if (uri instanceof vscode.Uri) {
+  const panelOptions = { enableScripts: true, localResourceRoots: [] };
+  const pendingViewStates = new Map();
+  let viewStateTimer;
+  let writingViewStates = Promise.resolve();
+
+  function flushViewStates() {
+    clearTimeout(viewStateTimer);
+    viewStateTimer = undefined;
+    if (!pendingViewStates.size) return writingViewStates;
+    const updates = [...pendingViewStates].map(async ([key, state]) => {
       try {
-        document = await vscode.workspace.openTextDocument(uri);
+        await context.workspaceState.update(key, state);
       } catch (error) {
-        return vscode.window.showErrorMessage('无法打开配置文件：' + error.message);
+        console.warn('Keil Wizard: unable to save view state', error);
       }
-    }
-    if (!document) return vscode.window.showInformationMessage('请先打开带配置向导注释的文件。');
+    });
+    pendingViewStates.clear();
+    writingViewStates = Promise.all([writingViewStates, ...updates]).then(() => {});
+    return writingViewStates;
+  }
+  flushViewStatesOnDeactivate = flushViewStates;
+
+  const addDroppedFiles = createWorkspaceFilesView(context, uri => {
+    panels.get(uri.toString())?.panel.dispose();
+  });
+
+  function initializePanel(panel, document, restoredViewState) {
     const sourceUri = document.uri;
     const key = sourceUri.toString();
-    const existing = panels.get(key);
-    if (existing) {
-      existing.refreshIfChanged(document);
-      existing.panel.reveal(targetColumn);
-      return;
-    }
-
-    const panel = vscode.window.createWebviewPanel('keilWizard', sourceUri.path.split('/').pop(), targetColumn, { enableScripts: true, localResourceRoots: [] });
+    const viewStateKey = 'keilWizard.viewState:' + key;
+    let viewState = restoredViewState ?? pendingViewStates.get(viewStateKey) ?? context.workspaceState.get(viewStateKey);
     let renderedText = document.getText();
     let revision = 0;
     let applying = false;
@@ -463,7 +564,7 @@ function activate(context) {
     const refresh = (text = renderedText) => {
       if (disposed) return;
       renderedText = text;
-      panel.webview.html = render(parse(text, sourceUri), ++revision, randomBytes(16).toString('hex'));
+      panel.webview.html = render(parse(text, sourceUri), ++revision, randomBytes(16).toString('hex'), key, viewState);
     };
     const refreshIfChanged = current => {
       if (applying) return;
@@ -475,6 +576,15 @@ function activate(context) {
       if (event.document.uri.toString() === key && event.contentChanges.length) refreshIfChanged(event.document);
     });
     const messageListener = panel.webview.onDidReceiveMessage(async message => {
+      if (message?.type === 'dropFiles') return addDroppedFiles(message.data);
+      if (message?.type === 'saveViewState') {
+        if (!disposed && message.state && typeof message.state === 'object' && !Array.isArray(message.state)) {
+          viewState = message.state;
+          pendingViewStates.set(viewStateKey, viewState);
+          viewStateTimer ??= setTimeout(flushViewStates, 200);
+        }
+        return;
+      }
       if (applying) return;
       applying = true;
       let current;
@@ -507,10 +617,68 @@ function activate(context) {
       panels.delete(key);
       listener.dispose();
       messageListener.dispose();
+      void flushViewStates();
     });
     refresh();
-  }));
-  createWorkspaceFilesView(context);
+  }
+
+  function setOutlineVisibility(menuContext, visible) {
+    const target = panels.get(menuContext?.keilWizardPanel) ?? [...panels.values()].find(({ panel }) => panel.active);
+    return target?.panel.webview.postMessage({ type: 'setOutlineVisibility', visible });
+  }
+
+  context.subscriptions.push(
+    vscode.window.registerWebviewPanelSerializer('keilWizard', {
+      async deserializeWebviewPanel(panel, state) {
+        if (typeof state?.sourceUri !== 'string' || !state.sourceUri) {
+          panel.dispose();
+          return;
+        }
+        try {
+          const uri = vscode.Uri.parse(state.sourceUri, true);
+          const document = uri.scheme === 'untitled'
+            ? vscode.workspace.textDocuments.find(current => current.uri.toString() === uri.toString())
+            : await vscode.workspace.openTextDocument(uri);
+          if (!document || panels.has(document.uri.toString())) {
+            panel.dispose();
+            return;
+          }
+          panel.webview.options = panelOptions;
+          initializePanel(panel, document, state.viewState);
+        } catch (error) {
+          panel.dispose();
+          vscode.window.showWarningMessage('无法恢复配置向导：' + error.message);
+        }
+      }
+    }),
+    vscode.commands.registerCommand('keilWizard.showOutline', menuContext => setOutlineVisibility(menuContext, true)),
+    vscode.commands.registerCommand('keilWizard.hideOutline', menuContext => setOutlineVisibility(menuContext, false)),
+    vscode.commands.registerCommand('keilWizard.open', async uri => {
+      const targetColumn = vscode.window.activeTextEditor?.viewColumn ?? vscode.window.activeNotebookEditor?.viewColumn ?? vscode.ViewColumn.Active;
+      let document = vscode.window.activeTextEditor?.document;
+      if (uri instanceof vscode.Uri) {
+        try {
+          document = await vscode.workspace.openTextDocument(uri);
+        } catch (error) {
+          return vscode.window.showErrorMessage('无法打开配置文件：' + error.message);
+        }
+      }
+      if (!document) return vscode.window.showInformationMessage('请先打开带配置向导注释的文件。');
+      const sourceUri = document.uri;
+      const existing = panels.get(sourceUri.toString());
+      if (existing) {
+        existing.refreshIfChanged(document);
+        existing.panel.reveal(targetColumn);
+        return;
+      }
+      const panel = vscode.window.createWebviewPanel('keilWizard', sourceUri.path.split('/').pop(), targetColumn, panelOptions);
+      initializePanel(panel, document);
+    })
+  );
 }
 
-module.exports = { activate };
+function deactivate() {
+  return flushViewStatesOnDeactivate?.();
+}
+
+module.exports = { activate, deactivate };

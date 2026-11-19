@@ -1,7 +1,22 @@
 const vscode = require('vscode');
 const path = require('node:path').posix;
 
-function createWorkspaceFilesView(context) {
+const fileDropMimeTypes = ['text/uri-list', 'application/vnd.code.uri-list', 'resourceurls'];
+
+function parseDroppedUris(mime, value) {
+  if (typeof value !== 'string' || !value) return [];
+  if (mime === 'resourceurls') {
+    try {
+      const resources = JSON.parse(value);
+      return Array.isArray(resources) ? resources : [];
+    } catch {
+      return [];
+    }
+  }
+  return value.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+}
+
+function createWorkspaceFilesView(context, onFileRemoved) {
   const updates = new vscode.EventEmitter();
   const storageKey = 'keilWizard.files';
   const fileName = 'keil-config-wizard.json';
@@ -87,14 +102,18 @@ function createWorkspaceFilesView(context) {
     }
     const lists = await Promise.all(folders.map(readFolder));
     if (add) {
+      const known = new Set(lists.flat().map(uri => uri.toString()));
+      const changed = new Set();
       for (const uri of uris) {
+        const key = uri.toString();
+        if (known.has(key)) continue;
         const folder = vscode.workspace.getWorkspaceFolder(uri) ?? folders[0];
         const index = folders.findIndex(item => item.uri.toString() === folder.uri.toString());
-        if (!lists.some(list => list.some(item => item.toString() === uri.toString()))) {
-          lists[index].push(uri);
-          await writeFolder(folder, lists[index]);
-        }
+        lists[index].push(uri);
+        known.add(key);
+        changed.add(index);
       }
+      for (const index of changed) await writeFolder(folders[index], lists[index]);
     } else {
       for (let index = 0; index < folders.length; index++) {
         const next = lists[index].filter(item => !uris.some(uri => uri.toString() === item.toString()));
@@ -102,9 +121,45 @@ function createWorkspaceFilesView(context) {
       }
     }
     await load();
+    return true;
+  }
+
+  async function addDroppedFiles(data) {
+    const candidates = new Map();
+    for (const mime of fileDropMimeTypes) {
+      for (const resource of parseDroppedUris(mime, data?.[mime])) {
+        if (typeof resource !== 'string') continue;
+        let uri;
+        try {
+          uri = vscode.Uri.parse(resource, true).with({ fragment: '' });
+        } catch {
+          continue;
+        }
+        if (uri.scheme === 'file' || uri.scheme === 'vscode-remote' || vscode.workspace.getWorkspaceFolder(uri)) {
+          candidates.set(uri.toString(), uri);
+        }
+      }
+    }
+    if (!candidates.size) return;
+
+    const checked = await Promise.allSettled([...candidates.values()].map(async uri => {
+      const stat = await vscode.workspace.fs.stat(uri);
+      return stat.type & vscode.FileType.File ? uri : undefined;
+    }));
+    const files = checked.flatMap(result => result.status === 'fulfilled' && result.value ? [result.value] : []);
+    if (!files.length) return;
+    try { await enqueue(() => changeList(files, true)); } catch {}
   }
 
   const view = vscode.window.createTreeView('keilWizard.files', {
+    dragAndDropController: {
+      dragMimeTypes: [],
+      dropMimeTypes: fileDropMimeTypes,
+      async handleDrop(_target, transfer, token) {
+        const entries = await Promise.all(fileDropMimeTypes.map(async mime => [mime, await transfer.get(mime)?.asString()]));
+        if (!token.isCancellationRequested) await addDroppedFiles(Object.fromEntries(entries));
+      }
+    },
     treeDataProvider: {
       onDidChangeTreeData: updates.event,
       getChildren: () => files,
@@ -150,10 +205,15 @@ function createWorkspaceFilesView(context) {
     }),
     vscode.commands.registerCommand('keilWizard.remove', async uri => {
       if (!(uri instanceof vscode.Uri)) return;
-      try { await enqueue(() => changeList([uri], false)); } catch {}
+      try {
+        await enqueue(async () => {
+          if (await changeList([uri], false)) onFileRemoved(uri);
+        });
+      } catch {}
     })
   );
   void enqueue(async () => { await migrate(); await load(); }).catch(() => {});
+  return addDroppedFiles;
 }
 
-module.exports = { createWorkspaceFilesView };
+module.exports = { createWorkspaceFilesView, fileDropMimeTypes };
