@@ -1,0 +1,94 @@
+{
+  "name": "keil-config-wizard",
+  "displayName": "Keil 文本配置向导",
+  "description": "通过表单编辑带 Keil Configuration Wizard 注释的源文件",
+  "publisher": "local-tools",
+  "version": "0.5.9",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MoonShadow-ZHyexi/keil-config-wizard.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "files": [
+    "extension.js",
+    "workspace-files.js",
+    "media/wizard.svg",
+    "example.h",
+    "README.md",
+    "LICENSE"
+  ],
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "name": "Keil 配置向导",
+          "id": "keilWizard.files",
+          "icon": "media/wizard.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "title": "打开 Keil 配置向导",
+        "command": "keilWizard.open"
+      },
+      {
+        "title": "打开源文件",
+        "command": "keilWizard.openSource"
+      },
+      {
+        "title": "添加到 Keil 配置向导",
+        "command": "keilWizard.add"
+      },
+      {
+        "icon": "$(remove)",
+        "command": "keilWizard.remove",
+        "title": "从 Keil 配置向导移除"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "keilWizard.openSource",
+          "when": "false"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "keilWizard.add",
+          "group": "navigation",
+          "when": "explorerResourceIsFolder == false"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "keilWizard.openSource",
+          "group": "navigation",
+          "when": "view == keilWizard.files && viewItem == keilWizardFile"
+        },
+        {
+          "command": "keilWizard.remove",
+          "group": "inline",
+          "when": "view == keilWizard.files && viewItem == keilWizardFile"
+        }
+      ],
+      "editor/context": [
+        {
+          "group": "navigation",
+          "command": "keilWizard.add"
+        },
+        {
+          "group": "navigation",
+          "command": "keilWizard.open"
+        }
+      ]
+    }
+  }
+}
