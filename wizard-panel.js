@@ -1,19 +1,20 @@
 const vscode = require('vscode');
 const { createHash, randomBytes } = require('node:crypto');
-const { parse, numericValue, replacement } = require('./configuration');
+const { parse, numericValue, replacement, defaultInput, isEditable } = require('./configuration');
 const { render, renderControl, renderForm } = require('./wizard-webview');
 
 function describeSource(text, uri) {
   const rows = parse(text, uri);
-  const structure = JSON.stringify(rows.map(({ raw, offset, numeric, annotationEnd, disabled, ...item }) => item));
+  // Values and source spans change on ordinary edits without rebuilding the form.
+  const structure = JSON.stringify(rows.map(({ raw, offset, numeric, annotationEnd, disabled, elements, commented, ...item }) => item));
   for (const row of rows) {
-    if (!row.raw || row.unsupported) continue;
-    const end = text.indexOf('\n', row.offset);
+    if (!isEditable(row)) continue;
+    const end = text.indexOf('\n', row.offset + row.raw.length);
     const before = text.slice(row.annotationEnd, row.offset).trim().replace(/[\t ]+/g, ' ');
     const suffix = text.slice(row.offset + row.raw.length, end < 0 ? text.length : end).trim();
     const after = suffix.replace(/^([)\]};,]*)[\t ]*(?:\/\/.*|\/\*(?:[^*]|\*(?!\/))*\*\/)$/, '$1');
     try {
-      const value = row.type === 's' ? row.raw : numericValue(row).toString();
+      const value = row.numeric ? numericValue(row).toString() : row.raw;
       row.sourceState = createHash('sha256').update(JSON.stringify([before, after, value])).digest('hex');
     } catch {
       // Invalid bit fields remain visible as diagnostics and have no editable value.
@@ -93,7 +94,8 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
         controls: replaceForm ? [] : rows.flatMap((row, index) => row.type === 'end' ? [] : [{
           index,
           disabled: row.disabled === true,
-          html: row.type === 'h' || row.type === 'z' ? undefined : renderControl(row, index)
+          resetEnabled: !row.disabled && isEditable(row),
+          html: ['h', 'z', 'n'].includes(row.type) ? undefined : renderControl(row, index)
         }])
       }).then(undefined, error => {
         console.warn('Keil Wizard: unable to update controls', error);
@@ -160,9 +162,11 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
           const before = text === rendered.text ? rendered : describeSource(text, sourceUri);
           if (current.isClosed || message.revision !== revision || before.structure !== rendered.structure) throw Error(conflict);
           const row = before.rows[message.index];
-          if (!row?.sourceState || typeof message.value !== 'string') throw Error('此配置项不可编辑。');
-          if (['q', 'e'].includes(row.type) && !/^[01]$/.test(message.value)) throw Error('开关值无效。');
-          const value = replacement(row, message.value);
+          if (!row?.sourceState || (message.reset !== true && typeof message.value !== 'string')) throw Error('此配置项不可编辑。');
+          // Resolve defaults against the latest parsed row, just like manual edits.
+          const input = message.reset === true ? defaultInput(row) : message.value;
+          if (['q', 'e', 'c'].includes(row.type) && !/^[01]$/.test(input)) throw Error('开关值无效。');
+          const value = replacement(row, input);
           if (value === row.raw) break;
           if (row.sourceState !== message.expected) throw Error(conflict);
           const start = row.offset;

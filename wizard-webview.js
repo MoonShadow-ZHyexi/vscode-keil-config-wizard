@@ -1,4 +1,4 @@
-const { integer, numericValue, display } = require('./configuration');
+const { numericValue, display, isEditable, selectedChoiceIndex } = require('./configuration');
 const { initializeWebview } = require('./wizard-webview-client');
 
 function escape(value) {
@@ -6,17 +6,20 @@ function escape(value) {
 }
 
 function renderControl(row, index) {
-  if (!'oqes'.includes(row.type) || row.unsupported) return '此标注暂不支持';
-  if (!row.raw) return '未找到可编辑的值';
+  if (row.issue) return '<span class="setting-issue" title="' + escape(row.issue) + '">' + escape(row.issue) + '</span>';
+  if (row.type === 'unsupported' || row.unsupported) return '此标注暂不支持';
+  if (!isEditable(row)) return '未找到可编辑的值';
   try {
     const id = ' data-index="' + index + '" aria-labelledby="setting-' + index + '" data-source-state="' + escape(row.sourceState) + '"' +
       (row.disabled ? ' disabled' : '');
-    if (row.type === 'q' || row.type === 'e') {
+    if (['q', 'e', 'c'].includes(row.type)) {
       return '<input type="checkbox"' + id + (numericValue(row) !== 0n ? ' checked' : '') + '>';
     }
+    if (row.type === 'a') {
+      return '<textarea rows="2" spellcheck="false"' + id + '>' + escape(display(row)) + '</textarea>';
+    }
     if (row.choices.length) {
-      const value = numericValue(row);
-      const selected = row.choices.findIndex(([key]) => integer(key, row.assembly) === value);
+      const selected = selectedChoiceIndex(row);
       return '<select' + id + '>' +
         (selected >= 0 ? '' : '<option selected disabled>当前值 ' + escape(display(row)) + '</option>') +
         row.choices.map(([key, label], choiceIndex) => '<option value="' + escape(key) + '"' + (choiceIndex === selected ? ' selected' : '') + '>' + escape(label || key) + '</option>').join('') + '</select>';
@@ -45,8 +48,13 @@ function renderForm(rows) {
     const help = escape(hint);
     const caption = '<span class="setting-copy"><span class="setting-name" id="setting-' + index + '" title="' + name + '">' + name +
       '</span>' + (hint ? '<small title="' + help + '">' + help + '</small>' : '') + '</span>';
-    const control = row.type === 'h' || row.type === 'z' ? '' :
-      '<span class="setting-control" data-control-index="' + index + '">' + renderControl(row, index) + '</span>';
+    // Reset has its own button so refreshing the input cannot replace it or its focus.
+    const reset = row.defaultValue === undefined ? '' :
+      '<button type="button" class="reset-setting" title="恢复默认值：' + escape(row.defaultValue) +
+      '"' + (row.disabled || !isEditable(row) ? ' disabled' : '') + '>恢复默认</button>';
+    const control = ['h', 'z', 'n'].includes(row.type) ? '' :
+      '<span class="setting-actions"><span class="setting-control" data-control-index="' + index + '">' +
+      renderControl(row, index) + '</span>' + reset + '</span>';
     const rowAttributes = (row.disabled ? ' setting-disabled' : '') + '" data-setting-index="' + index + '">';
 
     if (isGroup) {
@@ -64,7 +72,7 @@ function renderForm(rows) {
         '</div><ul class="tree-list tree-children" role="list" id="branch-' + index + '">';
       return;
     }
-    body += '<li class="setting-row tree-leaf' + rowAttributes +
+    body += '<li class="setting-row tree-leaf' + (row.type === 'n' ? ' setting-note' : '') + rowAttributes +
       '<span class="tree-marker" aria-hidden="true"></span>' + caption + control + '</li>';
   });
   return body ? '<ul class="tree-list" role="list">' + body + '</ul></li>'.repeat(levels.length - 1) + '</ul>'
@@ -82,9 +90,10 @@ function render(rows, revision, nonce, sourceUri, { scroll, collapsedGroups }, a
     .content{height:100%;overflow:auto;padding:0 32px 48px}
     .tree-toolbar{position:sticky;top:0;z-index:1;display:flex;gap:8px;padding:10px 0;background:var(--vscode-editor-background);border-bottom:1px solid var(--vscode-panel-border)}
     .tree-toolbar[hidden]{display:none}
-    .tree-toolbar button{padding:3px 10px;border:1px solid var(--vscode-button-border,transparent);border-radius:4px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;font-size:13px;cursor:pointer}
-    .tree-toolbar button:hover{background:var(--vscode-button-secondaryHoverBackground)}
-    .tree-toolbar button:focus-visible,.tree-toggle:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
+    .tree-toolbar button,.reset-setting{padding:3px 8px;border:1px solid var(--vscode-button-border,transparent);border-radius:4px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;font-size:13px;cursor:pointer}
+    .tree-toolbar button:hover,.reset-setting:enabled:hover{background:var(--vscode-button-secondaryHoverBackground)}
+    .tree-toolbar button:focus-visible,.tree-toggle:focus-visible,.reset-setting:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
+    .reset-setting:disabled{opacity:.55;cursor:default}
     .configuration{container-type:inline-size;white-space:nowrap}
     .configuration p,.setting-name,.setting-copy small,.setting-control{overflow:hidden;text-overflow:ellipsis}
     .tree-list{list-style:none;margin:0;padding:0}
@@ -102,16 +111,20 @@ function render(rows, revision, nonce, sourceUri, { scroll, collapsedGroups }, a
     .setting-copy{flex:1;min-width:0}
     .setting-name,.setting-copy small{display:block}
     .setting-copy small{font-size:14px;margin-top:4px;color:var(--vscode-descriptionForeground)}
-    .setting-disabled,.setting-disabled small,.setting-disabled input:disabled,.setting-disabled select:disabled{color:var(--vscode-disabledForeground,var(--vscode-descriptionForeground))}
-    .setting-disabled input:disabled,.setting-disabled select:disabled{opacity:.55}
-    .setting-control{flex:0 0 min(220px,55%);min-width:0;display:flex;justify-content:flex-start;align-items:center}
-    input:not([type=checkbox]),select{font:inherit;width:100%;height:36px;min-width:0;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--vscode-panel-border));border-radius:4px;padding:6px 10px}
-    input:focus,select:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
+    .setting-note{white-space:normal;color:var(--vscode-descriptionForeground)}
+    .setting-issue{color:var(--vscode-errorForeground);white-space:normal}
+    .setting-disabled,.setting-disabled small,.setting-disabled :is(input,select,textarea):disabled{color:var(--vscode-disabledForeground,var(--vscode-descriptionForeground))}
+    .setting-disabled :is(input,select,textarea):disabled{opacity:.55}
+    .setting-actions{flex:0 0 min(220px,55%);min-width:0;display:flex;align-items:center;gap:6px}
+    .setting-control{flex:1;min-width:0;display:flex;justify-content:flex-start;align-items:center}
+    input:not([type=checkbox]),select,textarea{font:inherit;width:100%;height:36px;min-width:0;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--vscode-panel-border));border-radius:4px;padding:6px 10px}
+    textarea{height:auto;resize:vertical;margin-block:5px}
+    input:focus,select:focus,textarea:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
     input[type=checkbox]{width:20px;height:20px;margin:0;vertical-align:middle;accent-color:var(--vscode-button-background)}
     @container(max-width:480px){
       .setting-row{padding-inline:4px}
       .tree-children{margin-inline-start:6px;padding-inline-start:4px}
-      input:not([type=checkbox]),select{padding-inline:4px}
+      input:not([type=checkbox]),select,textarea,.reset-setting{padding-inline:4px}
     }
     p{color:var(--vscode-descriptionForeground);margin:0 0 24px}
     @media(max-width:600px){.content{padding:0 16px 32px}}

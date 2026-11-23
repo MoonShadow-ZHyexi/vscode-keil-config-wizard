@@ -15,6 +15,10 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
   let destination;
   let exitAnimation;
 
+  function isTextField(field) {
+    return field?.type === 'text' || field?.type === 'textarea';
+  }
+
   function fade(from, to, timing) {
     if (document.body.classList.contains('vscode-reduce-motion') ||
         window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
@@ -64,10 +68,10 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
     vscode.setState({ ...vscode.getState(), sourceUri, edits: { pageId, nextChangeId, pendingChanges, draft } });
   }
 
-  function queueChange(field) {
+  function queueChange(field, reset = false) {
     if (field.disabled) return;
     const value = field.type === 'checkbox' ? String(Number(field.checked)) : field.value;
-    if (field.type === 'text') {
+    if (!reset && isTextField(field)) {
       if (submittedTextValues.get(field) === value) {
         persistEdits();
         return;
@@ -76,7 +80,7 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
     }
     pendingChanges.push({
       type: 'changeValue', id: ++nextChangeId, revision,
-      index: Number(field.dataset.index), value, expected: field.dataset.sourceState
+      index: Number(field.dataset.index), value, expected: field.dataset.sourceState, reset
     });
     persistEdits();
     sendNextChange();
@@ -112,6 +116,15 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
   }
 
   form.addEventListener('click', ({ target }) => {
+    const reset = target.closest('.reset-setting');
+    if (reset && !reset.disabled) {
+      const field = reset.closest('.setting-row').querySelector('[data-index]');
+      if (field) {
+        commitDraft();
+        queueChange(field, true);
+      }
+      return;
+    }
     const button = target.closest('.tree-toggle');
     if (!button) return;
     const key = button.dataset.groupKey;
@@ -147,7 +160,7 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
       destination = event.data.destination ?? 'text';
       commitDraft();
       const focused = document.activeElement;
-      if (focused?.matches('input[data-index],select[data-index]')) focused.blur();
+      if (focused?.matches('[data-index]')) focused.blur();
       sendNextChange();
     }
     if (event.data?.type === 'updateControls' && event.data.revision >= revision) {
@@ -178,6 +191,8 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
       for (const item of event.data.controls) {
         const setting = form.querySelector('[data-setting-index="' + item.index + '"]');
         setting?.classList.toggle('setting-disabled', item.disabled);
+        const reset = setting?.querySelector('.reset-setting');
+        if (reset) reset.disabled = !item.resetEnabled;
         const container = setting?.querySelector('.setting-control');
         if (!container) continue;
         const current = container.firstElementChild;
@@ -185,15 +200,15 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
           textDraft = undefined;
           persistEdits();
         }
-        if (current?.matches('input,select')) current.disabled = item.disabled;
+        if (current?.matches('input,select,textarea')) current.disabled = item.disabled;
         if (!item.disabled && pendingChanges.some(change => change.revision === revision && change.index === item.index)) continue;
         if (textDraft && container.contains(textDraft)) continue;
         const active = document.activeElement;
-        if (!item.disabled && item.index !== completed?.index && container.contains(active) && active.tagName === 'INPUT' && active.type === 'text') continue;
+        if (!item.disabled && item.index !== completed?.index && container.contains(active) && isTextField(active)) continue;
         const template = document.createElement('template');
         template.innerHTML = item.html;
         const updated = template.content.firstElementChild;
-        if (current && updated && current.tagName === updated.tagName && current.type === updated.type) {
+        if (current?.matches('input,select,textarea') && updated && current.tagName === updated.tagName && current.type === updated.type) {
           if (current.tagName === 'SELECT') {
             const oldOptions = [...current.options];
             const newOptions = [...updated.options];
@@ -204,7 +219,7 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
           if (current.type === 'checkbox') current.checked = updated.checked;
           else {
             current.value = updated.value;
-            if (current.type === 'text') submittedTextValues.set(current, updated.value);
+            if (isTextField(current)) submittedTextValues.set(current, updated.value);
           }
           current.dataset.sourceState = updated.dataset.sourceState;
         } else if (container.innerHTML !== item.html) {
@@ -216,7 +231,7 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
   });
 
   document.addEventListener('input', ({ target }) => {
-    if (!target.matches('input[type="text"][data-index]:enabled')) return;
+    if (!target.matches('[data-index]:enabled') || !isTextField(target)) return;
     textDraft = target;
     persistEdits();
   });
@@ -226,9 +241,9 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
     queueChange(target);
   });
   for (const change of pendingChanges) {
-    if (change.revision !== revision) continue;
+    if (change.revision !== revision || change.reset) continue;
     const field = restoreField(change);
-    if (field?.type === 'text') submittedTextValues.set(field, change.value);
+    if (isTextField(field)) submittedTextValues.set(field, change.value);
   }
   if (restoredEdits?.draft) textDraft = restoreField(restoredEdits.draft);
   if (restoredState?.edits && !restoredEdits) persistEdits();

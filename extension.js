@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { parse } = require('./configuration');
+const { parse, isEditable } = require('./configuration');
 const { createWizardPanels } = require('./wizard-panel');
 const { createEditorAssociations } = require('./editor-associations');
 
@@ -73,8 +73,7 @@ function activate(context) {
 
   function eligible(document) {
     if (!document || document.uri.scheme === 'untitled') return false;
-    return parse(document.getText(), document.uri).some(row =>
-      ['o', 'q', 'e', 's'].includes(row.type) && row.raw && !row.unsupported);
+    return parse(document.getText(), document.uri).some(isEditable);
   }
 
   function updateEditorActions() {
