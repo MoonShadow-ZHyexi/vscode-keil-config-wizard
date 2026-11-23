@@ -9,6 +9,9 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
   const restoredEdits = restoredState?.edits?.pageId === pageId ? restoredState.edits : undefined;
   const pendingChanges = restoredEdits?.pendingChanges ?? [];
   const submittedTextValues = new WeakMap();
+  const settings = new Map();
+  const deferredControls = new Map();
+  let sequence = 0;
   let nextChangeId = restoredEdits?.nextChangeId ?? 0;
   let textDraft;
   let changeInFlight = false;
@@ -17,6 +20,17 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
 
   function isTextField(field) {
     return field?.type === 'text' || field?.type === 'textarea';
+  }
+
+  function indexSettings() {
+    settings.clear();
+    for (const setting of form.querySelectorAll('[data-setting-index]')) {
+      settings.set(Number(setting.dataset.settingIndex), setting);
+    }
+  }
+
+  function fieldAt(index) {
+    return settings.get(index)?.querySelector('[data-index]');
   }
 
   function fade(from, to, timing) {
@@ -51,7 +65,7 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
   }
 
   function restoreField({ index, value, expected }) {
-    const field = document.querySelector('[data-index="' + index + '"]');
+    const field = fieldAt(index);
     if (!field) return;
     if (field.type === 'checkbox') field.checked = value === '1';
     else field.value = value;
@@ -115,6 +129,55 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
     }
   }
 
+  function updateControl(item, completedIndex, blurredField) {
+    const setting = settings.get(item.index);
+    if (!setting) return true;
+    setting.classList.toggle('setting-disabled', item.disabled);
+    const reset = setting.querySelector('.reset-setting');
+    if (reset) reset.disabled = !item.resetEnabled;
+    const container = setting.querySelector('.setting-control');
+    if (!container) return true;
+    const current = container.firstElementChild;
+    if (item.disabled && textDraft === current) {
+      textDraft = undefined;
+      persistEdits();
+    }
+    if (current?.matches('input,select,textarea')) current.disabled = item.disabled;
+    // Save the latest source update until a focused or queued edit can be replaced safely.
+    if (!item.disabled && (textDraft === current ||
+        pendingChanges.some(change => change.revision === revision && change.index === item.index) ||
+        (item.index !== completedIndex && current !== blurredField && current === document.activeElement && isTextField(current)))) {
+      return false;
+    }
+    const template = document.createElement('template');
+    template.innerHTML = item.html;
+    const updated = template.content.firstElementChild;
+    if (current?.matches('input,select,textarea') && updated && current.tagName === updated.tagName && current.type === updated.type) {
+      if (current.tagName === 'SELECT') {
+        const oldOptions = [...current.options];
+        const newOptions = [...updated.options];
+        const sameOptions = oldOptions.length === newOptions.length && oldOptions.every((option, index) =>
+          option.value === newOptions[index].value && option.textContent === newOptions[index].textContent && option.disabled === newOptions[index].disabled);
+        if (!sameOptions) current.replaceChildren(...updated.childNodes);
+      }
+      if (current.type === 'checkbox') current.checked = updated.checked;
+      else {
+        current.value = updated.value;
+        if (isTextField(current)) submittedTextValues.set(current, updated.value);
+      }
+      current.dataset.sourceState = updated.dataset.sourceState;
+    } else if (container.innerHTML !== item.html) {
+      container.innerHTML = item.html;
+    }
+    return true;
+  }
+
+  form.addEventListener('focusout', ({ target }) => {
+    const index = Number(target.dataset.index);
+    const item = deferredControls.get(index);
+    if (item && updateControl(item, undefined, target)) deferredControls.delete(index);
+  });
+
   form.addEventListener('click', ({ target }) => {
     const reset = target.closest('.reset-setting');
     if (reset && !reset.disabled) {
@@ -146,6 +209,7 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
     saveViewState();
   });
 
+  indexSettings();
   restoreTreeState();
   content.scrollTop = restoredState?.viewState?.scroll ?? savedScrollPosition;
   saveViewState(false);
@@ -164,6 +228,11 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
       sendNextChange();
     }
     if (event.data?.type === 'updateControls' && event.data.revision >= revision) {
+      if (event.data.sequence <= sequence) return;
+      if (!event.data.full && event.data.sequence !== sequence + 1) {
+        vscode.postMessage({ type: 'viewReady', revision });
+        return;
+      }
       if (event.data.revision > revision) {
         if (typeof event.data.formHtml !== 'string') {
           vscode.postMessage({ type: 'viewReady', revision });
@@ -172,14 +241,17 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
         commitDraft();
         revision = event.data.revision;
         form.innerHTML = event.data.formHtml;
+        deferredControls.clear();
+        indexSettings();
         restoreTreeState();
       }
+      sequence = event.data.sequence;
       let completed;
       while (pendingChanges[0]?.id <= event.data.completedChange) completed = pendingChanges.shift();
       if (completed) {
         changeInFlight = false;
         for (const { index, before, after } of event.data.rebased) {
-          const field = document.querySelector('[data-index="' + index + '"]');
+          const field = fieldAt(index);
           if (field?.dataset.sourceState === before) field.dataset.sourceState = after;
           for (const change of pendingChanges) {
             if (change.revision === revision && change.index === index && change.expected === before) change.expected = after;
@@ -189,42 +261,10 @@ function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntr
       }
       if (event.data.resumeEdits) commitDraft();
       for (const item of event.data.controls) {
-        const setting = form.querySelector('[data-setting-index="' + item.index + '"]');
-        setting?.classList.toggle('setting-disabled', item.disabled);
-        const reset = setting?.querySelector('.reset-setting');
-        if (reset) reset.disabled = !item.resetEnabled;
-        const container = setting?.querySelector('.setting-control');
-        if (!container) continue;
-        const current = container.firstElementChild;
-        if (item.disabled && textDraft && container.contains(textDraft)) {
-          textDraft = undefined;
-          persistEdits();
-        }
-        if (current?.matches('input,select,textarea')) current.disabled = item.disabled;
-        if (!item.disabled && pendingChanges.some(change => change.revision === revision && change.index === item.index)) continue;
-        if (textDraft && container.contains(textDraft)) continue;
-        const active = document.activeElement;
-        if (!item.disabled && item.index !== completed?.index && container.contains(active) && isTextField(active)) continue;
-        const template = document.createElement('template');
-        template.innerHTML = item.html;
-        const updated = template.content.firstElementChild;
-        if (current?.matches('input,select,textarea') && updated && current.tagName === updated.tagName && current.type === updated.type) {
-          if (current.tagName === 'SELECT') {
-            const oldOptions = [...current.options];
-            const newOptions = [...updated.options];
-            const sameOptions = oldOptions.length === newOptions.length && oldOptions.every((option, index) =>
-              option.value === newOptions[index].value && option.textContent === newOptions[index].textContent && option.disabled === newOptions[index].disabled);
-            if (!sameOptions) current.replaceChildren(...updated.childNodes);
-          }
-          if (current.type === 'checkbox') current.checked = updated.checked;
-          else {
-            current.value = updated.value;
-            if (isTextField(current)) submittedTextValues.set(current, updated.value);
-          }
-          current.dataset.sourceState = updated.dataset.sourceState;
-        } else if (container.innerHTML !== item.html) {
-          container.innerHTML = item.html;
-        }
+        deferredControls.set(item.index, item);
+      }
+      for (const [index, item] of deferredControls) {
+        if (updateControl(item, completed?.index)) deferredControls.delete(index);
       }
       sendNextChange();
     }

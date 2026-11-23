@@ -431,4 +431,35 @@ function replacement(row, input) {
   return formatInteger(value, row.numeric ?? inputInteger);
 }
 
-module.exports = { parse, integer, numericValue, display, replacement, defaultInput, isEditable, selectedChoiceIndex };
+function createDocumentReader() {
+  const eligibility = new WeakMap();
+  let recent;
+
+  function read(document) {
+    const { version } = document;
+    if (recent?.document === document && Number.isInteger(version) && recent.version === version) return recent;
+
+    const text = document.getText();
+    if (recent?.document !== document || recent.text !== text) {
+      const rows = parse(text, document.uri);
+      recent = { document, version, text, rows, eligible: rows.some(isEditable) };
+    } else {
+      recent.version = version;
+    }
+    // Keep one parsed document for the toolbar and wizard to share. Other tabs
+    // only need their last eligibility result, rather than a copy of their text.
+    eligibility.set(document, { version, eligible: recent.eligible });
+    return recent;
+  }
+
+  function isEligible(document) {
+    const cached = eligibility.get(document);
+    return cached && Number.isInteger(document.version) && cached.version === document.version
+      ? cached.eligible
+      : read(document).eligible;
+  }
+
+  return { read, isEligible };
+}
+
+module.exports = { parse, integer, numericValue, display, replacement, defaultInput, isEditable, selectedChoiceIndex, createDocumentReader };

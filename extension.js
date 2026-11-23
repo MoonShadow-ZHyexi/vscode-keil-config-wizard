@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { parse, isEditable } = require('./configuration');
+const { createDocumentReader } = require('./configuration');
 const { createWizardPanels } = require('./wizard-panel');
 const { createEditorAssociations } = require('./editor-associations');
 
@@ -7,6 +7,7 @@ const editorType = 'keilWizard.editor';
 const webviewType = 'keilWizard';
 const rememberedFilesKey = 'keilWizard.rememberedWizardFiles';
 const nativeReopenWait = 100;
+const toolbarEditDelay = 120;
 let finishDeactivation;
 
 function textTabKey(tab) {
@@ -31,8 +32,10 @@ function activate(context) {
   const newTextTabs = new WeakSet();
   const pendingNativeSwitches = new Map();
   const previewTabs = new Map();
+  const documents = createDocumentReader();
   let pendingModeWrite = Promise.resolve();
   let previewRestoreTimer;
+  let toolbarEditTimer;
   let wizardTarget;
   let switchingEditor = false;
   let convertibleResource;
@@ -57,6 +60,7 @@ function activate(context) {
   }
 
   const { panels, initializePanel, flushViewStates } = createWizardPanels(context.workspaceState, {
+    readDocument: documents.read,
     switchMode,
     onViewChange() {
       updateEditorActions();
@@ -66,6 +70,7 @@ function activate(context) {
 
   finishDeactivation = () => {
     clearTimeout(previewRestoreTimer);
+    clearTimeout(toolbarEditTimer);
     for (const timer of pendingNativeSwitches.values()) clearTimeout(timer);
     pendingNativeSwitches.clear();
     return Promise.all([flushViewStates(), pendingModeWrite, syncEditorAssociations()]);
@@ -73,10 +78,12 @@ function activate(context) {
 
   function eligible(document) {
     if (!document || document.uri.scheme === 'untitled') return false;
-    return parse(document.getText(), document.uri).some(isEditable);
+    return documents.isEligible(document);
   }
 
   function updateEditorActions() {
+    clearTimeout(toolbarEditTimer);
+    toolbarEditTimer = undefined;
     const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
     const editor = vscode.window.activeTextEditor;
     const uri = editor?.document.uri.toString();
@@ -497,7 +504,10 @@ function activate(context) {
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => void syncEditorAssociations()),
     vscode.workspace.onDidChangeTextDocument(event => {
-      if (event.document === vscode.window.activeTextEditor?.document) updateEditorActions();
+      if (!event.contentChanges.length || event.document !== vscode.window.activeTextEditor?.document) return;
+      // Coalesce typing bursts. Commands still check eligibility on invocation.
+      clearTimeout(toolbarEditTimer);
+      toolbarEditTimer = setTimeout(updateEditorActions, toolbarEditDelay);
     }),
     vscode.commands.registerCommand('keilWizard.convertCurrent', resource => convertCurrent('wizard', resource)),
     vscode.commands.registerCommand('keilWizard.returnToText', resource => convertCurrent('text', resource)),

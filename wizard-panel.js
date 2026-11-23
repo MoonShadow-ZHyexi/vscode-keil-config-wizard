@@ -1,31 +1,32 @@
 const vscode = require('vscode');
 const { createHash, randomBytes } = require('node:crypto');
-const { parse, numericValue, replacement, defaultInput, isEditable } = require('./configuration');
+const { parse, numericValue, replacement, defaultInput, isEditable, createDocumentReader } = require('./configuration');
 const { render, renderControl, renderForm } = require('./wizard-webview');
 
-function describeSource(text, uri) {
-  const rows = parse(text, uri);
+function describeSource(text, rows) {
   // Values and source spans change on ordinary edits without rebuilding the form.
   const structure = JSON.stringify(rows.map(({ raw, offset, numeric, annotationEnd, disabled, elements, commented, ...item }) => item));
-  for (const row of rows) {
-    if (!isEditable(row)) continue;
+  const described = rows.map(row => {
+    if (!isEditable(row)) return row;
     const end = text.indexOf('\n', row.offset + row.raw.length);
     const before = text.slice(row.annotationEnd, row.offset).trim().replace(/[\t ]+/g, ' ');
     const suffix = text.slice(row.offset + row.raw.length, end < 0 ? text.length : end).trim();
     const after = suffix.replace(/^([)\]};,]*)[\t ]*(?:\/\/.*|\/\*(?:[^*]|\*(?!\/))*\*\/)$/, '$1');
     try {
       const value = row.numeric ? numericValue(row).toString() : row.raw;
-      row.sourceState = createHash('sha256').update(JSON.stringify([before, after, value])).digest('hex');
+      const sourceState = createHash('sha256').update(JSON.stringify([before, after, value])).digest('hex');
+      return { ...row, sourceState };
     } catch {
       // Invalid bit fields remain visible as diagnostics and have no editable value.
     }
-  }
-  return { text, rows, structure };
+    return row;
+  });
+  return { text, rows: described, structure };
 }
 
 function rebasedControls(applied, current, uri) {
   if (!applied) return [];
-  const committed = applied.text === current.text ? current : describeSource(applied.text, uri);
+  const committed = applied.text === current.text ? current : describeSource(applied.text, parse(applied.text, uri));
   if (committed.structure !== applied.before.structure) return [];
   return committed.rows.flatMap(({ sourceState: after }, index) => {
     const before = applied.before.rows[index].sourceState;
@@ -35,7 +36,26 @@ function rebasedControls(applied, current, uri) {
   });
 }
 
-function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
+function collectControls(rows, previousRows, forceIndex, full) {
+  const controls = [];
+  if (!full && !previousRows && forceIndex === undefined) return controls;
+  rows.forEach((row, index) => {
+    if (row.type === 'end') return;
+    const previous = previousRows?.[index];
+    // With unchanged form structure, these values cover what renderControl displays.
+    if (!full && index !== forceIndex && (!previous ||
+        (previous.raw === row.raw && previous.disabled === row.disabled && previous.sourceState === row.sourceState))) return;
+    controls.push({
+      index,
+      disabled: row.disabled === true,
+      resetEnabled: !row.disabled && isEditable(row),
+      html: ['h', 'z', 'n'].includes(row.type) ? undefined : renderControl(row, index)
+    });
+  });
+  return controls;
+}
+
+function createWizardPanels(workspaceState, { readDocument = createDocumentReader().read, switchMode, onViewChange }) {
   const panels = new Map();
   const pendingViewStates = new Map();
   let viewStateTimer;
@@ -69,7 +89,9 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
       previewOrigin: savedState.previewOrigin === 'text' ? 'text' : 'wizard'
     };
     let rendered;
+    let initialFormIsCurrent = true;
     let revision = 0;
+    let sequence = 0;
     let completed;
     let wasVisible = panel.visible;
     let wasActive = panel.active;
@@ -81,22 +103,21 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
       pendingViewStates.set(viewStateKey, state);
       viewStateTimer ??= setTimeout(flushViewStates, 200);
     };
-    const sendControls = (resumeEdits = false, replaceForm = false) => {
+    const sendControls = ({ previousRows, forceIndex, full = false, resumeEdits = false, replaceForm = false } = {}) => {
       if (disposed || !panel.visible) return;
       const { rows } = rendered;
+      const controls = replaceForm ? [] : collectControls(rows, previousRows, forceIndex, full);
+      if (!controls.length && !replaceForm && !resumeEdits && forceIndex === undefined) return;
       void panel.webview.postMessage({
         type: 'updateControls',
         revision,
+        sequence: ++sequence,
+        full: full || replaceForm,
         resumeEdits,
         completedChange: completed?.id,
         rebased: completed?.rebased.filter(({ index, after }) => rows[index]?.sourceState === after) ?? [],
         formHtml: replaceForm ? renderForm(rows) : undefined,
-        controls: replaceForm ? [] : rows.flatMap((row, index) => row.type === 'end' ? [] : [{
-          index,
-          disabled: row.disabled === true,
-          resetEnabled: !row.disabled && isEditable(row),
-          html: ['h', 'z', 'n'].includes(row.type) ? undefined : renderControl(row, index)
-        }])
+        controls
       }).then(undefined, error => {
         console.warn('Keil Wizard: unable to update controls', error);
       });
@@ -109,24 +130,28 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
     };
     if (preview !== undefined) setPreview(preview, 'text');
 
-    const refresh = (text, changeId, applied) => {
+    const describeDocument = document => {
+      const { text, rows } = readDocument(document);
+      return text === rendered?.text ? rendered : describeSource(text, rows);
+    };
+    const refresh = (current, message, applied) => {
       if (disposed) return;
       const previous = rendered;
-      const current = describeSource(text, sourceUri);
       rendered = current;
       if (!previous) {
         panel.webview.html = render(current.rows, ++revision, randomBytes(16).toString('hex'), key, viewState, animateEntry);
         return;
       }
+      initialFormIsCurrent = false;
       const replaceForm = current.structure !== previous.structure;
       if (replaceForm) revision++;
-      if (changeId !== undefined) completed = { id: changeId, rebased: rebasedControls(applied, current, sourceUri) };
-      sendControls(false, replaceForm);
+      if (message) completed = { id: message.id, rebased: rebasedControls(applied, current, sourceUri) };
+      sendControls({ previousRows: previous.rows, replaceForm, forceIndex: message?.index });
     };
     const refreshIfChanged = current => {
-      if (applying) return;
-      const text = current.getText();
-      if (text !== rendered.text) refresh(text);
+      if (applying || disposed) return;
+      const source = describeDocument(current);
+      if (source !== rendered) refresh(source);
     };
     panels.set(key, {
       panel, document, refreshIfChanged, setPreview, sourceUri,
@@ -139,7 +164,12 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
       if (message?.type === 'sourceSwitchReady') {
         return switchMode(panel, sourceUri, message.destination === 'wizard' ? 'wizard' : 'text');
       }
-      if (message?.type === 'viewReady') return sendControls(true, message.revision !== revision);
+      if (message?.type === 'viewReady') {
+        const replaceForm = message.revision !== revision;
+        // The first Webview already has all controls in its initial HTML.
+        const full = replaceForm || !initialFormIsCurrent || sequence !== 0;
+        return sendControls({ full, resumeEdits: true, replaceForm });
+      }
       if (message?.type === 'saveViewState') {
         const { scroll, collapsedGroups } = message;
         if (!disposed && Number.isFinite(scroll) &&
@@ -148,8 +178,8 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
         }
         return;
       }
-      if (message?.type !== 'changeValue' || !Number.isSafeInteger(message.id) || applying) return;
-      if (completed && message.id <= completed.id) return sendControls();
+      if (message?.type !== 'changeValue' || !Number.isSafeInteger(message.id) || !Number.isSafeInteger(message.index) || applying) return;
+      if (completed && message.id <= completed.id) return sendControls({ forceIndex: message.index });
       applying = true;
       let current;
       let applied;
@@ -158,8 +188,8 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
         if (disposed) return;
         const conflict = '该配置项的源文件内容已变化，已刷新，请重新确认配置值。';
         for (let attempt = 0; attempt < 2; attempt++) {
-          const text = current.getText();
-          const before = text === rendered.text ? rendered : describeSource(text, sourceUri);
+          const before = describeDocument(current);
+          const { text } = before;
           if (current.isClosed || message.revision !== revision || before.structure !== rendered.structure) throw Error(conflict);
           const row = before.rows[message.index];
           if (!row?.sourceState || (message.reset !== true && typeof message.value !== 'string')) throw Error('此配置项不可编辑。');
@@ -186,7 +216,7 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
         vscode.window.showErrorMessage(error.message);
       } finally {
         applying = false;
-        refresh(current?.getText() ?? rendered.text, message.id, applied);
+        if (!disposed) refresh(current ? describeDocument(current) : rendered, message, applied);
       }
     });
     panel.onDidDispose(() => {
@@ -202,11 +232,11 @@ function createWizardPanels(workspaceState, { switchMode, onViewChange }) {
       const lostFocus = wasActive && !panel.active;
       wasVisible = panel.visible;
       wasActive = panel.active;
-      if (becameVisible || lostFocus) sendControls(true);
+      if (becameVisible || lostFocus) sendControls({ resumeEdits: true, full: becameVisible });
       onViewChange();
     });
     panel.onDidDispose(() => viewListener.dispose());
-    refresh(document.getText());
+    refresh(describeDocument(document));
     onViewChange();
   }
 
