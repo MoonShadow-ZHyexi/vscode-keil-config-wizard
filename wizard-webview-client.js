@@ -1,48 +1,24 @@
-function initializeWebview(revision, sourceUri, savedState, animateEntry) {
+function initializeWebview(revision, sourceUri, savedScrollPosition, animateEntry, pageId, savedCollapsedGroups) {
   const vscode = acquireVsCodeApi();
-  const layout = document.querySelector('.layout');
   const content = document.querySelector('.content');
-  const outline = document.querySelector('.outline');
-  const outlineList = document.querySelector('.outline-list');
-  const splitter = document.querySelector('.splitter');
-  const menuContext = JSON.parse(layout.dataset.vscodeContext);
+  const form = document.querySelector('.configuration');
+  const toolbar = document.querySelector('.tree-toolbar');
   const restoredState = vscode.getState();
-  const state = restoredState?.viewState ?? savedState ?? {};
-  const collapsed = new Set(state.collapsed || []);
-  const minimumOutlineWidth = 112;
-  let outlineWidth = Math.max(minimumOutlineWidth, state.width || 240);
-  let outlineHidden = state.outlineHidden === true;
-  let outlineScroll = state.outlineScroll || 0;
-  let drag;
-
-  const parents = [];
-  const entries = Array.from(outlineList.querySelectorAll('.outline-row'), row => {
-    const depth = Number(row.dataset.depth);
-    while (parents.length && parents.at(-1).depth >= depth) parents.pop();
-    const target = document.getElementById(row.dataset.id);
-    const entry = {
-      row, depth, id: row.dataset.id, target, parent: parents.at(-1),
-      heading: target.querySelector('legend'),
-      label: row.querySelector('.outline-item'),
-      toggle: row.querySelector('.outline-toggle')
-    };
-    parents.push(entry);
-    return entry;
-  });
-  const entriesById = new Map(entries.map(entry => [entry.id, entry]));
-  let activeSection;
-  let highlighted;
-  let outlineJump;
-  let lastSnapshot;
-  const pendingChanges = [];
+  let collapsedGroups = restoredState?.viewState?.collapsedGroups ?? savedCollapsedGroups;
+  let lastViewState;
+  const restoredEdits = restoredState?.edits?.pageId === pageId ? restoredState.edits : undefined;
+  const pendingChanges = restoredEdits?.pendingChanges ?? [];
+  const submittedTextValues = new WeakMap();
+  let nextChangeId = restoredEdits?.nextChangeId ?? 0;
+  let textDraft;
   let changeInFlight = false;
-  let switchingToSource = false;
+  let destination;
   let exitAnimation;
 
   function fade(from, to, timing) {
     if (document.body.classList.contains('vscode-reduce-motion') ||
         window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-    return layout.animate([{ opacity: from }, { opacity: to }], timing);
+    return content.animate([{ opacity: from }, { opacity: to }], timing);
   }
 
   const entryTiming = { duration: 130, easing: 'ease-out' };
@@ -50,16 +26,16 @@ function initializeWebview(revision, sourceUri, savedState, animateEntry) {
   function sendNextChange() {
     if (changeInFlight) return;
     if (!pendingChanges.length) {
-      if (!switchingToSource || exitAnimation) return;
-      const animation = fade(1, 0.7, { duration: 90, easing: 'ease-in', fill: 'forwards' });
+      if (!destination || exitAnimation) return;
+      const animation = destination === 'text' && fade(1, 0.7, { duration: 90, easing: 'ease-in', fill: 'forwards' });
       const finish = () => {
         exitAnimation = undefined;
-        switchingToSource = false;
-        vscode.postMessage({ type: 'sourceSwitchReady' });
+        vscode.postMessage({ type: 'sourceSwitchReady', destination });
+        destination = undefined;
         // Restore opacity if the editor is still visible after the switch request.
         if (animation) window.setTimeout(() => animation.cancel(), 150);
       };
-      exitAnimation = animation;
+      exitAnimation = animation || undefined;
       if (animation) animation.onfinish = finish;
       else finish();
       return;
@@ -67,145 +43,155 @@ function initializeWebview(revision, sourceUri, savedState, animateEntry) {
     exitAnimation?.cancel();
     exitAnimation = undefined;
     changeInFlight = true;
-    vscode.postMessage({ revision, ...pendingChanges[0] });
+    vscode.postMessage(pendingChanges[0]);
   }
 
-  function saveState(persist = true) {
-    const snapshot = {
-      width: outlineWidth,
-      outlineHidden,
-      scroll: content.scrollTop,
-      outlineScroll: outline.hidden ? outlineScroll : outlineList.scrollTop,
-      collapsed: [...collapsed],
-      activeSection: activeSection?.id ?? null
+  function restoreField({ index, value, expected }) {
+    const field = document.querySelector('[data-index="' + index + '"]');
+    if (!field) return;
+    if (field.type === 'checkbox') field.checked = value === '1';
+    else field.value = value;
+    field.dataset.sourceState = expected;
+    return field;
+  }
+
+  function persistEdits() {
+    const draft = textDraft && {
+      index: Number(textDraft.dataset.index),
+      value: textDraft.value,
+      expected: textDraft.dataset.sourceState
     };
-    const serialized = JSON.stringify(snapshot);
-    if (serialized === lastSnapshot) return;
-    lastSnapshot = serialized;
-    vscode.setState({ sourceUri, viewState: snapshot });
-    if (persist) vscode.postMessage({ type: 'saveViewState', state: snapshot });
+    vscode.setState({ ...vscode.getState(), sourceUri, edits: { pageId, nextChangeId, pendingChanges, draft } });
   }
 
-  function highlightCurrent(reveal = true) {
-    let visible = activeSection;
-    while (visible?.row.hidden) visible = visible.parent;
-    if (highlighted !== visible) {
-      highlighted?.label.removeAttribute('aria-current');
-      highlighted = visible;
-      highlighted?.label.setAttribute('aria-current', 'location');
-    }
-    if (!reveal || !visible || outline.hidden) return;
-    const row = visible.row.getBoundingClientRect();
-    const viewport = outlineList.getBoundingClientRect();
-    if (row.top < viewport.top) outlineList.scrollTop += row.top - viewport.top;
-    else if (row.bottom > viewport.bottom) outlineList.scrollTop += row.bottom - viewport.bottom;
-  }
-
-  function updateOutline() {
-    for (const { row, id, parent, toggle, label } of entries) {
-      row.hidden = Boolean(parent && (parent.row.hidden || collapsed.has(parent.id)));
-      if (toggle) {
-        const expanded = !collapsed.has(id);
-        toggle.setAttribute('aria-expanded', String(expanded));
-        toggle.setAttribute('aria-label', (expanded ? '折叠 ' : '展开 ') + label.textContent);
+  function queueChange(field) {
+    if (field.disabled) return;
+    const value = field.type === 'checkbox' ? String(Number(field.checked)) : field.value;
+    if (field.type === 'text') {
+      if (submittedTextValues.get(field) === value) {
+        persistEdits();
+        return;
       }
+      submittedTextValues.set(field, value);
+    }
+    pendingChanges.push({
+      type: 'changeValue', id: ++nextChangeId, revision,
+      index: Number(field.dataset.index), value, expected: field.dataset.sourceState
+    });
+    persistEdits();
+    sendNextChange();
+  }
+
+  function commitDraft() {
+    const field = textDraft;
+    textDraft = undefined;
+    if (field?.isConnected) queueChange(field);
+  }
+
+  function saveViewState(persist = true) {
+    const scroll = content.scrollTop;
+    if (scroll === lastViewState?.scroll && collapsedGroups === lastViewState.collapsedGroups) return;
+    const viewState = { scroll, collapsedGroups };
+    lastViewState = viewState;
+    vscode.setState({ ...vscode.getState(), sourceUri, viewState });
+    if (persist) vscode.postMessage({ type: 'saveViewState', revision, ...viewState });
+  }
+
+  function setBranchCollapsed(button, collapsed) {
+    button.setAttribute('aria-expanded', String(!collapsed));
+    document.getElementById(button.getAttribute('aria-controls')).hidden = collapsed;
+  }
+
+  function restoreTreeState() {
+    const collapsed = new Set(collapsedGroups);
+    const buttons = form.querySelectorAll('.tree-toggle');
+    toolbar.hidden = buttons.length === 0;
+    for (const button of buttons) {
+      setBranchCollapsed(button, collapsed.has(button.dataset.groupKey));
     }
   }
 
-  function updateCurrent(reveal = true) {
-    const boundary = content.getBoundingClientRect().top + 40;
-    activeSection = undefined;
-    for (const entry of entries) {
-      if (entry.heading.getBoundingClientRect().top > boundary) break;
-      activeSection = entry;
-    }
-    highlightCurrent(reveal);
-  }
-
-  function maximumOutlineWidth() {
-    return Math.max(0, layout.clientWidth - splitter.offsetWidth - 120);
-  }
-
-  function applyOutlineWidth() {
-    const max = maximumOutlineWidth();
-    const width = outlineHidden || max < minimumOutlineWidth ? 0 : Math.min(max, outlineWidth);
-    const wasHidden = outline.hidden;
-    if (!wasHidden && !width) outlineScroll = outlineList.scrollTop;
-    outline.hidden = width === 0;
-    if (wasHidden !== outline.hidden) {
-      menuContext.keilWizardOutlineVisible = !outline.hidden;
-      layout.dataset.vscodeContext = JSON.stringify(menuContext);
-    }
-    layout.style.setProperty('--outline-width', width + 'px');
-    splitter.setAttribute('aria-valuemax', String(max));
-    splitter.setAttribute('aria-valuenow', String(Math.round(width)));
-    splitter.title = width ? '拖动以调整大纲宽度' : '向右拖动以打开大纲';
-    if (wasHidden && width) {
-      outlineList.scrollTop = outlineScroll;
-    }
-  }
-
-  function setOutlineVisibility(visible) {
-    outlineHidden = !visible;
-    applyOutlineWidth();
-    saveState();
-  }
-
-  function setCollapsed(entry, isCollapsed) {
-    if (isCollapsed) collapsed.add(entry.id);
-    else collapsed.delete(entry.id);
-    updateOutline();
-    highlightCurrent();
-    saveState();
-  }
-
-  updateOutline();
-  applyOutlineWidth();
-  content.scrollTop = state.scroll || 0;
-  outlineJump = content.scrollTop;
-  activeSection = entriesById.get(state.activeSection);
-  if (activeSection) highlightCurrent(false);
-  else updateCurrent(false);
-  saveState(false);
-
-  content.addEventListener('scroll', () => {
-    if (content.scrollTop !== outlineJump) {
-      outlineJump = undefined;
-      updateCurrent();
-    }
-    saveState();
+  form.addEventListener('click', ({ target }) => {
+    const button = target.closest('.tree-toggle');
+    if (!button) return;
+    const key = button.dataset.groupKey;
+    const children = document.getElementById(button.getAttribute('aria-controls'));
+    const collapse = button.getAttribute('aria-expanded') === 'true';
+    if (collapse && textDraft && children.contains(textDraft)) commitDraft();
+    collapsedGroups = collapse ? [...collapsedGroups, key] : collapsedGroups.filter(group => group !== key);
+    setBranchCollapsed(button, collapse);
+    saveViewState();
   });
-  outlineList.addEventListener('scroll', () => {
-    if (outline.hidden) return;
-    outlineScroll = outlineList.scrollTop;
-    saveState();
+
+  toolbar.addEventListener('click', ({ target }) => {
+    const button = target.closest('[data-tree-action]');
+    if (!button) return;
+    const collapse = button.dataset.treeAction === 'collapse';
+    if (collapse) commitDraft();
+    collapsedGroups = collapse ? [...form.querySelectorAll('.tree-toggle')].map(branch => branch.dataset.groupKey) : [];
+    restoreTreeState();
+    saveViewState();
   });
-  window.addEventListener('resize', applyOutlineWidth);
+
+  restoreTreeState();
+  content.scrollTop = restoredState?.viewState?.scroll ?? savedScrollPosition;
+  saveViewState(false);
+  content.addEventListener('scroll', () => saveViewState());
+  window.addEventListener('blur', commitDraft);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) commitDraft();
+  });
   window.addEventListener('message', event => {
-    if (event.data?.type === 'setOutlineVisibility') setOutlineVisibility(event.data.visible);
     if (event.data?.type === 'animateEntry') fade(0.7, 1, entryTiming);
     if (event.data?.type === 'prepareSourceSwitch') {
-      switchingToSource = true;
+      destination = event.data.destination ?? 'text';
+      commitDraft();
       const focused = document.activeElement;
       if (focused?.matches('input[data-index],select[data-index]')) focused.blur();
       sendNextChange();
     }
-    if (event.data?.type === 'updateControls') {
-      revision = event.data.revision;
-      const completedIndex = event.data.completedChange && changeInFlight ? pendingChanges[0].index : undefined;
-      if (event.data.completedChange && changeInFlight) {
-        pendingChanges.shift();
-        changeInFlight = false;
+    if (event.data?.type === 'updateControls' && event.data.revision >= revision) {
+      if (event.data.revision > revision) {
+        if (typeof event.data.formHtml !== 'string') {
+          vscode.postMessage({ type: 'viewReady', revision });
+          return;
+        }
+        commitDraft();
+        revision = event.data.revision;
+        form.innerHTML = event.data.formHtml;
+        restoreTreeState();
       }
+      let completed;
+      while (pendingChanges[0]?.id <= event.data.completedChange) completed = pendingChanges.shift();
+      if (completed) {
+        changeInFlight = false;
+        for (const { index, before, after } of event.data.rebased) {
+          const field = document.querySelector('[data-index="' + index + '"]');
+          if (field?.dataset.sourceState === before) field.dataset.sourceState = after;
+          for (const change of pendingChanges) {
+            if (change.revision === revision && change.index === index && change.expected === before) change.expected = after;
+          }
+        }
+        persistEdits();
+      }
+      if (event.data.resumeEdits) commitDraft();
       for (const item of event.data.controls) {
-        if (pendingChanges.some(change => change.index === item.index)) continue;
-        const container = document.querySelector('[data-control-index="' + item.index + '"]');
+        const setting = form.querySelector('[data-setting-index="' + item.index + '"]');
+        setting?.classList.toggle('setting-disabled', item.disabled);
+        const container = setting?.querySelector('.setting-control');
         if (!container) continue;
+        const current = container.firstElementChild;
+        if (item.disabled && textDraft && container.contains(textDraft)) {
+          textDraft = undefined;
+          persistEdits();
+        }
+        if (current?.matches('input,select')) current.disabled = item.disabled;
+        if (!item.disabled && pendingChanges.some(change => change.revision === revision && change.index === item.index)) continue;
+        if (textDraft && container.contains(textDraft)) continue;
         const active = document.activeElement;
-        if (item.index !== completedIndex && container.contains(active) && active.tagName === 'INPUT' && active.type === 'text') continue;
+        if (!item.disabled && item.index !== completed?.index && container.contains(active) && active.tagName === 'INPUT' && active.type === 'text') continue;
         const template = document.createElement('template');
         template.innerHTML = item.html;
-        const current = container.firstElementChild;
         const updated = template.content.firstElementChild;
         if (current && updated && current.tagName === updated.tagName && current.type === updated.type) {
           if (current.tagName === 'SELECT') {
@@ -216,7 +202,11 @@ function initializeWebview(revision, sourceUri, savedState, animateEntry) {
             if (!sameOptions) current.replaceChildren(...updated.childNodes);
           }
           if (current.type === 'checkbox') current.checked = updated.checked;
-          else current.value = updated.value;
+          else {
+            current.value = updated.value;
+            if (current.type === 'text') submittedTextValues.set(current, updated.value);
+          }
+          current.dataset.sourceState = updated.dataset.sourceState;
         } else if (container.innerHTML !== item.html) {
           container.innerHTML = item.html;
         }
@@ -225,99 +215,24 @@ function initializeWebview(revision, sourceUri, savedState, animateEntry) {
     }
   });
 
-  outline.addEventListener('click', event => {
-    const action = event.target.closest('[data-action]');
-    if (action) {
-      collapsed.clear();
-      if (action.dataset.action === 'collapse') {
-        for (const entry of entries) if (entry.toggle) collapsed.add(entry.id);
-      }
-      updateOutline();
-      highlightCurrent();
-      saveState();
-      return;
-    }
-
-    const toggle = event.target.closest('.outline-toggle');
-    const label = event.target.closest('.outline-item');
-    const entry = entriesById.get((toggle || label)?.closest('.outline-row').dataset.id);
-    if (toggle) {
-      setCollapsed(entry, !collapsed.has(entry.id));
-    } else if (label) {
-      content.scrollTop += entry.target.getBoundingClientRect().top - content.getBoundingClientRect().top - 16;
-      outlineJump = content.scrollTop;
-      activeSection = entry;
-      highlightCurrent();
-      saveState();
-    }
-  });
-
-  outlineList.addEventListener('keydown', event => {
-    const row = event.target.closest('.outline-row');
-    if (!row || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
-    const entry = entriesById.get(row.dataset.id);
-    const visible = entries.filter(item => !item.row.hidden);
-    const index = visible.indexOf(entry);
-    let next;
-    switch (event.key) {
-      case 'ArrowUp': next = visible[index - 1]; break;
-      case 'ArrowDown': next = visible[index + 1]; break;
-      case 'Home': next = visible[0]; break;
-      case 'End': next = visible.at(-1); break;
-      case 'ArrowLeft':
-        if (entry.toggle && !collapsed.has(entry.id)) setCollapsed(entry, true);
-        else next = entry.parent;
-        break;
-      case 'ArrowRight':
-        if (entry.toggle && collapsed.has(entry.id)) setCollapsed(entry, false);
-        else if (visible[index + 1]?.parent === entry) next = visible[index + 1];
-        break;
-      default: return;
-    }
-    event.preventDefault();
-    next?.label.focus();
-  });
-
-  splitter.addEventListener('pointerdown', event => {
-    if (event.button !== 0 || drag) return;
-    drag = {
-      pointerId: event.pointerId,
-      width: outlineWidth,
-      offset: event.clientX - splitter.getBoundingClientRect().left
-    };
-    splitter.setPointerCapture(event.pointerId);
-    event.preventDefault();
-  });
-  splitter.addEventListener('pointermove', event => {
-    if (drag?.pointerId !== event.pointerId) return;
-    const width = event.clientX - layout.getBoundingClientRect().left - drag.offset;
-    outlineHidden = width < minimumOutlineWidth;
-    outlineWidth = outlineHidden ? drag.width : Math.max(minimumOutlineWidth, Math.min(width, maximumOutlineWidth()));
-    applyOutlineWidth();
-    saveState();
-  });
-  splitter.addEventListener('lostpointercapture', event => {
-    if (drag?.pointerId === event.pointerId) drag = undefined;
-  });
-  splitter.addEventListener('keydown', event => {
-    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-    event.preventDefault();
-    if (outline.hidden) {
-      if (event.key === 'ArrowRight') setOutlineVisibility(true);
-      return;
-    }
-    const width = Math.min(outlineWidth, maximumOutlineWidth()) + (event.key === 'ArrowRight' ? 10 : -10);
-    outlineHidden = width < minimumOutlineWidth;
-    if (!outlineHidden) outlineWidth = Math.min(width, maximumOutlineWidth());
-    applyOutlineWidth();
-    saveState();
+  document.addEventListener('input', ({ target }) => {
+    if (!target.matches('input[type="text"][data-index]:enabled')) return;
+    textDraft = target;
+    persistEdits();
   });
   document.addEventListener('change', ({ target }) => {
     if (!target.dataset.index) return;
-    const value = target.type === 'checkbox' ? String(Number(target.checked)) : target.value;
-    pendingChanges.push({ index: Number(target.dataset.index), value });
-    sendNextChange();
+    if (textDraft === target) textDraft = undefined;
+    queueChange(target);
   });
+  for (const change of pendingChanges) {
+    if (change.revision !== revision) continue;
+    const field = restoreField(change);
+    if (field?.type === 'text') submittedTextValues.set(field, change.value);
+  }
+  if (restoredEdits?.draft) textDraft = restoreField(restoredEdits.draft);
+  if (restoredState?.edits && !restoredEdits) persistEdits();
+  vscode.postMessage({ type: 'viewReady', revision });
   if (animateEntry && !restoredState) fade(0.7, 1, entryTiming);
 }
 

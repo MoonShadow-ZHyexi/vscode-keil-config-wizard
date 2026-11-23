@@ -1,9 +1,11 @@
 const { parseInteger, formatInteger } = require('./integer-literals');
+const { createConditionEvaluator, updateCondition } = require('./wizard-conditions');
 
 const wizardStart = /<<<\s*Use Configuration Wizard in Context Menu\s*>>>/i;
 const optionTag = /^([oqes])(\d*)(?:\.(\d+)(?:\.\.(\d+))?)?$/;
 const choiceTag = /^([+-]?[\w'&]+)=$/;
 const rangeTag = /^([+-]?[\w'&]+)-([+-]?[\w'&]+)(?::([+-]?[\w'&]+))?$/;
+const conditionTags = new Set(['if', 'elif', 'else', 'endif']);
 const cTokens = /\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[A-Za-z_$][\w$]*|[+-]?(?:\d|\.\d)(?:[eEpP][+-]|[\w$.'])*/g;
 const asmTokens = new RegExp(/;[^\r\n]*|[+-]?&[\da-fA-F][\w$.']*/.source + '|' + cTokens.source, 'g');
 
@@ -27,6 +29,8 @@ function parse(source, uri) {
   const assembly = /\.(?:s|asm|a51|a66|inc|src|ini)$/i.test(uri?.path ?? '');
   const tokens = assembly ? asmTokens : cTokens;
   const rows = [];
+  const conditions = [];
+  let evaluateCondition;
   let active = !marked;
   let current;
   let commentEnd;
@@ -50,6 +54,18 @@ function parse(source, uri) {
         const [, annotation] = tag;
         let label = tag[2];
         let kind = annotation.replace(/\s/g, '');
+        if (conditionTags.has(kind)) {
+          current = undefined;
+          try {
+            updateCondition(conditions, kind, () => {
+              evaluateCondition ??= createConditionEvaluator(source, tokens, assembly);
+              return evaluateCondition(label, token.index);
+            });
+          } catch (error) {
+            rows.push({ type: 'unsupported', label: '条件标注 <' + kind + '> 无效', help: error.message, disabled: true });
+          }
+          continue;
+        }
         if (!marked && current) {
           if (kind === 'i') {
             const inline = /^<([^<>]+)>\s*(.*)$/.exec(label);
@@ -83,14 +99,19 @@ function parse(source, uri) {
           continue;
         }
         const option = optionTag.exec(kind);
+        const disabled = conditions.at(-1)?.active === false;
         if (option) {
           const [, type, skip, low, high] = option;
-          current = { type, label, skip: Number(skip), low, high, choices: [], assembly };
+          current = { type, label, skip: Number(skip), low, high, choices: [], assembly, annotationEnd: token.index + raw.length };
+          if (disabled) current.disabled = true;
           rows.push(current);
           pending.push(current);
         } else {
           current = undefined;
-          rows.push({ type: kind === 'h' ? 'h' : /^\/[he]$/.test(kind) ? 'end' : 'unsupported', label: label || kind });
+          const type = kind === 'h' || kind === 'z' ? kind : /^\/[hez]$/.test(kind) ? 'end' : 'unsupported';
+          const row = { type, label: label || kind };
+          if (disabled && type !== 'end') row.disabled = true;
+          rows.push(row);
         }
       }
     } else if (active && pending.length) {
@@ -146,6 +167,7 @@ function display(row) {
 }
 
 function replacement(row, input) {
+  if (row.disabled) throw Error('该配置项的条件不成立，当前不可修改。');
   if (row.type === 's') {
     if (!/^(?:[^"\\\x00-\x1f\x7f]|\\[^\x00-\x1f\x7f])*$/.test(input)) throw Error('字符串包含未转义的引号、反斜杠或控制字符。');
     if (row.low !== undefined && input.length > Number(row.low)) throw Error('字符串超过标注长度。');

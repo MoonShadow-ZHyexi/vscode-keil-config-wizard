@@ -3,7 +3,7 @@
   "displayName": "Keil 文本配置向导",
   "description": "通过表单编辑带 Keil Configuration Wizard 注释的源文件",
   "publisher": "local-tools",
-  "version": "0.5.32",
+  "version": "0.5.41",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -27,6 +27,7 @@
     "wizard-webview-client.js",
     "wizard-webview.js",
     "wizard-panel.js",
+    "wizard-conditions.js",
     "integer-literals.js",
     "example.h",
     "README.md",
@@ -54,29 +55,31 @@
         "icon": "$(code)"
       },
       {
+        "command": "keilWizard.togglePreview",
+        "title": "切换源文本预览",
+        "icon": "$(open-preview)"
+      },
+      {
         "title": "打开 Keil 配置向导",
         "command": "keilWizard.open"
-      },
-      {
-        "title": "打开大纲",
-        "command": "keilWizard.showOutline"
-      },
-      {
-        "title": "关闭大纲",
-        "command": "keilWizard.hideOutline"
       }
     ],
     "menus": {
       "editor/title": [
         {
           "command": "keilWizard.convertCurrent",
-          "when": "resource in keilWizard.convertibleResources && !activeCustomEditorId",
+          "when": "(resource in keilWizard.convertibleResources && !activeCustomEditorId) || keilWizard.previewActive",
           "group": "navigation"
         },
         {
           "command": "keilWizard.returnToText",
-          "when": "activeCustomEditorId == keilWizard.editor || (resourceScheme == webview-panel && keilWizard.legacyWizardActive && (!activeWebviewPanelId || activeWebviewPanelId == keilWizard))",
+          "when": "keilWizard.previewActive || activeCustomEditorId == keilWizard.editor || (resourceScheme == webview-panel && keilWizard.legacyWizardActive && (!activeWebviewPanelId || activeWebviewPanelId == keilWizard))",
           "group": "navigation"
+        },
+        {
+          "command": "keilWizard.togglePreview",
+          "when": "keilWizard.previewActive || (resource in keilWizard.convertibleResources && !activeCustomEditorId) || activeCustomEditorId == keilWizard.editor || (resourceScheme == webview-panel && keilWizard.legacyWizardActive && (!activeWebviewPanelId || activeWebviewPanelId == keilWizard))",
+          "group": "navigation@1"
         }
       ],
       "commandPalette": [
@@ -89,24 +92,8 @@
           "when": "false"
         },
         {
-          "command": "keilWizard.showOutline",
+          "command": "keilWizard.togglePreview",
           "when": "false"
-        },
-        {
-          "command": "keilWizard.hideOutline",
-          "when": "false"
-        }
-      ],
-      "webview/context": [
-        {
-          "command": "keilWizard.showOutline",
-          "when": "keilWizardPanel && !keilWizardOutlineVisible",
-          "group": "navigation"
-        },
-        {
-          "command": "keilWizard.hideOutline",
-          "when": "keilWizardPanel && keilWizardOutlineVisible",
-          "group": "navigation"
         }
       ],
       "editor/context": [
