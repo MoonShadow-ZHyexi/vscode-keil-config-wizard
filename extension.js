@@ -1,5 +1,6 @@
 const vscode = require('vscode');
 const { createDocumentReader } = require('./configuration');
+const { createIncludeAccess } = require('./wizard-includes');
 const { createWizardPanels } = require('./wizard-panel');
 const { createEditorAssociations } = require('./editor-associations');
 
@@ -32,7 +33,8 @@ function activate(context) {
   const newTextTabs = new WeakSet();
   const pendingNativeSwitches = new Map();
   const previewTabs = new Map();
-  const documents = createDocumentReader();
+  const includes = createIncludeAccess(vscode);
+  const documents = createDocumentReader(includes.resolve);
   let pendingModeWrite = Promise.resolve();
   let previewRestoreTimer;
   let toolbarEditTimer;
@@ -60,7 +62,8 @@ function activate(context) {
   }
 
   const { panels, initializePanel, flushViewStates } = createWizardPanels(context.workspaceState, {
-    readDocument: documents.read,
+    documents,
+    watchInclude: includes.watch,
     switchMode,
     onViewChange() {
       updateEditorActions();

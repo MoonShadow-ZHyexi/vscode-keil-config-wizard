@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const { createHash, randomBytes } = require('node:crypto');
-const { parse, numericValue, replacement, defaultInput, isEditable, createDocumentReader } = require('./configuration');
+const { numericValue, replacement, defaultInput, isEditable, createDocumentReader } = require('./configuration');
+const { includePath } = require('./wizard-includes');
 const { render, renderControl, renderForm } = require('./wizard-webview');
 
 function describeSource(text, rows) {
@@ -24,9 +25,9 @@ function describeSource(text, rows) {
   return { text, rows: described, structure };
 }
 
-function rebasedControls(applied, current, uri) {
+function rebasedControls(applied, current, uri, parseSource) {
   if (!applied) return [];
-  const committed = applied.text === current.text ? current : describeSource(applied.text, parse(applied.text, uri));
+  const committed = applied.text === current.text ? current : describeSource(applied.text, parseSource(applied.text, uri).rows);
   if (committed.structure !== applied.before.structure) return [];
   return committed.rows.flatMap(({ sourceState: after }, index) => {
     const before = applied.before.rows[index].sourceState;
@@ -55,7 +56,7 @@ function collectControls(rows, previousRows, forceIndex, full) {
   return controls;
 }
 
-function createWizardPanels(workspaceState, { readDocument = createDocumentReader().read, switchMode, onViewChange }) {
+function createWizardPanels(workspaceState, { documents = createDocumentReader(), watchInclude, switchMode, onViewChange }) {
   const panels = new Map();
   const pendingViewStates = new Map();
   let viewStateTimer;
@@ -97,6 +98,8 @@ function createWizardPanels(workspaceState, { readDocument = createDocumentReade
     let wasActive = panel.active;
     let applying = false;
     let disposed = false;
+    let includesDirty = false;
+    const includeWatches = new Map();
 
     const saveViewState = state => {
       viewState = state;
@@ -131,13 +134,25 @@ function createWizardPanels(workspaceState, { readDocument = createDocumentReade
     if (preview !== undefined) setPreview(preview, 'text');
 
     const describeDocument = document => {
-      const { text, rows } = readDocument(document);
-      return text === rendered?.text ? rendered : describeSource(text, rows);
+      const { text, rows, dependencies } = documents.read(document, includesDirty);
+      includesDirty = false;
+      if (text === rendered?.text && rows === rendered.sourceRows) return rendered;
+      return { ...describeSource(text, rows), sourceRows: rows, dependencies };
     };
     const refresh = (current, message, applied) => {
       if (disposed) return;
       const previous = rendered;
       rendered = current;
+      if (watchInclude) {
+        for (const [file, subscription] of includeWatches) {
+          if (current.dependencies.has(file)) continue;
+          subscription.dispose();
+          includeWatches.delete(file);
+        }
+        for (const [key, file] of current.dependencies) {
+          if (!includeWatches.has(key)) includeWatches.set(key, watchInclude(file, includeChanged));
+        }
+      }
       if (!previous) {
         panel.webview.html = render(current.rows, ++revision, randomBytes(16).toString('hex'), key, viewState, animateEntry);
         return;
@@ -145,7 +160,7 @@ function createWizardPanels(workspaceState, { readDocument = createDocumentReade
       initialFormIsCurrent = false;
       const replaceForm = current.structure !== previous.structure;
       if (replaceForm) revision++;
-      if (message) completed = { id: message.id, rebased: rebasedControls(applied, current, sourceUri) };
+      if (message) completed = { id: message.id, rebased: rebasedControls(applied, current, sourceUri, documents.parseSource) };
       sendControls({ previousRows: previous.rows, replaceForm, forceIndex: message?.index });
     };
     const refreshIfChanged = current => {
@@ -153,12 +168,21 @@ function createWizardPanels(workspaceState, { readDocument = createDocumentReade
       const source = describeDocument(current);
       if (source !== rendered) refresh(source);
     };
+    const includeChanged = () => {
+      includesDirty = true;
+      refreshIfChanged(panels.get(key)?.document ?? document);
+    };
     panels.set(key, {
       panel, document, refreshIfChanged, setPreview, sourceUri,
       previewOrigin: () => viewState.preview ? viewState.previewOrigin : undefined
     });
     const listener = vscode.workspace.onDidChangeTextDocument(event => {
-      if (event.document.uri.toString() === key && event.contentChanges.length) refreshIfChanged(event.document);
+      if (!event.contentChanges.length) return;
+      if (event.document.uri.toString() === key) refreshIfChanged(event.document);
+      else if (rendered.dependencies.has(includePath(event.document.uri))) includeChanged();
+    });
+    const closeListener = watchInclude && vscode.workspace.onDidCloseTextDocument?.(closed => {
+      if (rendered.dependencies.has(includePath(closed.uri))) includeChanged();
     });
     const messageListener = panel.webview.onDidReceiveMessage(async message => {
       if (message?.type === 'sourceSwitchReady') {
@@ -223,6 +247,9 @@ function createWizardPanels(workspaceState, { readDocument = createDocumentReade
       disposed = true;
       if (panels.get(key)?.panel === panel) panels.delete(key);
       listener.dispose();
+      closeListener?.dispose();
+      for (const subscription of includeWatches.values()) subscription.dispose();
+      includeWatches.clear();
       messageListener.dispose();
       void flushViewStates();
       onViewChange();
@@ -236,6 +263,8 @@ function createWizardPanels(workspaceState, { readDocument = createDocumentReade
       onViewChange();
     });
     panel.onDidDispose(() => viewListener.dispose());
+    // A header may have changed on disk since the toolbar last parsed the file.
+    includesDirty = documents.read(document).dependencies.size > 0;
     refresh(describeDocument(document));
     onViewChange();
   }

@@ -171,39 +171,65 @@ function updateCondition(stack, kind, test) {
   }
 }
 
-function createConditionEvaluator(source, sourceTokens, assembly) {
-  const code = source.replace(sourceTokens, token =>
-    /^(?:\/[/\*]|;)/.test(token) ? token.replace(/[^\r\n]/g, ' ') : token);
-  const directives = code.matchAll(/^[\t ]*#[\t ]*(define|undef|if|ifdef|ifndef|elif|else|endif)\b((?:\\\r?\n|[^\r\n])*)/gm);
+function createConditionEvaluator(source, sourceTokens, assembly, uri, resolveInclude) {
   const macros = new Map();
-  const branches = [];
-  let next = directives.next();
+  const activeFiles = new Set();
+  const onceFiles = new Set();
+  const fileKey = resource => resource?.fsPath ?? resource?.path;
+  activeFiles.add(fileKey(uri));
 
+  function processFile(text, resource) {
+    const code = text.replace(sourceTokens, token =>
+      /^(?:\/[/\*]|;)/.test(token) ? token.replace(/[^\r\n]/g, ' ') : token);
+    const directives = code.matchAll(/^[\t ]*#[\t ]*(define|undef|if|ifdef|ifndef|elif|else|endif|include|pragma)\b((?:\\\r?\n|[^\r\n])*)/gm);
+    // Included headers share the caller's macros but have their own branch stack.
+    const branches = [];
+    let next = directives.next();
+    return position => {
+      while (!next.done && next.value.index < position) {
+        const [, directive, argument] = next.value;
+        next = directives.next();
+        const value = argument.replace(/\\\r?\n/g, '').trim();
+        if (directive === 'include' || directive === 'pragma' || directive === 'define' || directive === 'undef') {
+          if (branches.at(-1)?.active === false) continue;
+          if (directive === 'pragma') {
+            if (value === 'once') onceFiles.add(fileKey(resource));
+          } else if (directive === 'include') {
+            const name = /^"([^"]+)"$/.exec(value)?.[1];
+            if (!name || !resolveInclude || activeFiles.size >= 64) continue;
+            const header = resolveInclude(resource, name);
+            if (!header) continue;
+            const key = fileKey(header.uri);
+            if (activeFiles.has(key) || onceFiles.has(key)) continue;
+            activeFiles.add(key);
+            processFile(header.text, header.uri)(Infinity);
+            activeFiles.delete(key);
+          } else {
+            const match = /^([A-Za-z_$][\w$]*)(.*)$/.exec(value);
+            if (!match) continue;
+            const [, name, body] = match;
+            if (directive === 'undef') macros.delete(name);
+            else macros.set(name, body.startsWith('(') ? null : body.trim());
+          }
+          continue;
+        }
+        const kind = directive === 'ifdef' || directive === 'ifndef' ? 'if' : directive;
+        try {
+          updateCondition(branches, kind, () => {
+            if (directive === 'ifdef') return macros.has(value);
+            if (directive === 'ifndef') return !macros.has(value);
+            return evaluateExpression(value, macros, assembly);
+          });
+        } catch {
+          // Compiler-specific directives can still depend on unavailable definitions.
+        }
+      }
+    };
+  }
+
+  const advance = processFile(source, uri);
   return (expression, position) => {
-    while (!next.done && next.value.index < position) {
-      const [, directive, argument] = next.value;
-      next = directives.next();
-      const value = argument.replace(/\\\r?\n/g, '').trim();
-      if (directive === 'define' || directive === 'undef') {
-        if (branches.at(-1)?.active === false) continue;
-        const match = /^([A-Za-z_$][\w$]*)(.*)$/.exec(value);
-        if (!match) continue;
-        const [, name, body] = match;
-        if (directive === 'undef') macros.delete(name);
-        else macros.set(name, body.startsWith('(') ? null : body.trim());
-        continue;
-      }
-      const kind = directive === 'ifdef' || directive === 'ifndef' ? 'if' : directive;
-      try {
-        updateCondition(branches, kind, () => {
-          if (directive === 'ifdef') return macros.has(value);
-          if (directive === 'ifndef') return !macros.has(value);
-          return evaluateExpression(value, macros, assembly);
-        });
-      } catch {
-        // Compiler-specific directives may be undecidable using just this file.
-      }
-    }
+    advance(position);
     return evaluateExpression(expression, macros, assembly);
   };
 }

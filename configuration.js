@@ -194,7 +194,7 @@ function applyGroupState(rows) {
   }
 }
 
-function parse(source, uri) {
+function parse(source, uri, resolveInclude) {
   const marked = wizardStart.test(source);
   if (!marked && !/<\s*(?:[oqesya][\d.]*|!?c\d*)(?:\s+[A-Za-z_$][\w$]*)?\s*>/.test(source)) return [];
   const assembly = /\.(?:s|asm|a51|a66|inc|src|ini)$/i.test(uri?.path ?? '');
@@ -250,7 +250,7 @@ function parse(source, uri) {
           current = undefined;
           try {
             updateCondition(conditions, kind, () => {
-              evaluateCondition ??= createConditionEvaluator(source, tokens, assembly);
+              evaluateCondition ??= createConditionEvaluator(source, tokens, assembly, uri, resolveInclude);
               return evaluateCondition(label, position);
             });
           } catch (error) {
@@ -431,18 +431,39 @@ function replacement(row, input) {
   return formatInteger(value, row.numeric ?? inputInteger);
 }
 
-function createDocumentReader() {
+function createDocumentReader(resolveInclude) {
   const eligibility = new WeakMap();
   let recent;
 
-  function read(document) {
+  function parseSource(text, uri) {
+    const dependencies = new Map();
+    const headers = new Map();
+    const missing = new Set();
+    const rows = parse(text, uri, resolveInclude && ((from, name) => {
+      const request = JSON.stringify([from?.path, name]);
+      if (!headers.has(request)) {
+        const header = resolveInclude(from, name, dependencies);
+        headers.set(request, header);
+        if (!header && from?.scheme === 'file') missing.add(name);
+      }
+      return headers.get(request);
+    }));
+    if (missing.size) rows.unshift({
+      type: 'n',
+      label: '条件求值找不到引用的头文件',
+      help: [...missing].join('、')
+    });
+    return { rows, dependencies };
+  }
+
+  function read(document, reloadIncludes = false) {
     const { version } = document;
-    if (recent?.document === document && Number.isInteger(version) && recent.version === version) return recent;
+    if (!reloadIncludes && recent?.document === document && Number.isInteger(version) && recent.version === version) return recent;
 
     const text = document.getText();
-    if (recent?.document !== document || recent.text !== text) {
-      const rows = parse(text, document.uri);
-      recent = { document, version, text, rows, eligible: rows.some(isEditable) };
+    if (reloadIncludes || recent?.document !== document || recent.text !== text) {
+      const parsed = parseSource(text, document.uri);
+      recent = { document, version, text, ...parsed, eligible: parsed.rows.some(isEditable) };
     } else {
       recent.version = version;
     }
@@ -459,7 +480,7 @@ function createDocumentReader() {
       : read(document).eligible;
   }
 
-  return { read, isEligible };
+  return { read, isEligible, parseSource };
 }
 
 module.exports = { parse, integer, numericValue, display, replacement, defaultInput, isEditable, selectedChoiceIndex, createDocumentReader };
